@@ -2422,10 +2422,10 @@ async def save_step1_essential(data: dict):
 @app.post("/api/setup/step2/configuration")
 async def save_step2_configuration(data: dict):
     """
-    Save and validate Step 2: Configuration (Trakt + Sync settings + Notifications).
-    
+    Save and validate Step 2: Configuration (Sync settings + optional Trakt + Notifications).
+
     Expected data:
-        - trakt_client_id: str
+        - trakt_client_id: str (optional)
         - sync_interval: int
         - auto_sync: bool
         - timezone: str
@@ -2439,12 +2439,10 @@ async def save_step2_configuration(data: dict):
         config = ConfigManager()
         errors = {}
         
-        # Validate Trakt Client ID
+        # Validate Trakt Client ID (optional - only checked when provided)
         trakt_client_id = data.get('trakt_client_id', '').strip()
-        if not trakt_client_id:
-            errors['trakt_client_id'] = 'Trakt Client ID is required'
-        
-        # Test Trakt Client ID if no errors so far
+
+        # Test Trakt Client ID if provided and no errors so far
         if not errors and trakt_client_id:
             # Validate format first - check for valid hex string
             import re

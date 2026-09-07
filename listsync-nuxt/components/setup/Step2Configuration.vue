@@ -6,7 +6,7 @@
         Configure Your Settings
       </h2>
       <p class="text-xs sm:text-sm text-muted-foreground max-w-xl mx-auto">
-        Set up Trakt integration, sync schedule, and optional Discord notifications.
+        Set up your sync schedule, plus optional Trakt integration and Discord notifications.
       </p>
     </div>
 
@@ -14,16 +14,15 @@
     <div class="p-3 sm:p-4 rounded-lg bg-gradient-to-br from-purple-600/20 to-purple-500/10 border border-purple-500/25 space-y-2.5 sm:space-y-3" role="group" aria-labelledby="trakt-section">
       <div class="flex items-center gap-2 mb-1">
         <component :is="FilmIcon" :size="16" class="text-purple-400" aria-hidden="true" />
-        <span id="trakt-section" class="text-xs font-bold text-purple-300 uppercase tracking-wide">Trakt</span>
+        <span id="trakt-section" class="text-xs font-bold text-purple-300 uppercase tracking-wide">Trakt (Optional)</span>
       </div>
       
       <div>
         <div class="flex items-center gap-1.5 mb-2">
           <label for="trakt-client-id" class="text-xs font-semibold text-foreground">
             Client ID
-            <span class="text-red-400 ml-1" aria-label="required">*</span>
           </label>
-          <Tooltip content="Your Trakt Client ID. Create a new application at trakt.tv/oauth/applications to get your Client ID.">
+          <Tooltip content="Optional. Only used as a last-resort ID resolver. Leave empty unless you already have a Trakt Client ID (trakt.tv/oauth/applications).">
             <HelpCircleIcon :size="14" class="text-purple-400/60 hover:text-purple-400 cursor-help transition-colors" />
           </Tooltip>
         </div>
@@ -31,10 +30,9 @@
           id="trakt-client-id"
           v-model="localValue.trakt_client_id"
           type="password"
-          placeholder="••••••••••••••••"
+          placeholder="Leave empty to skip"
           :icon="KeyIcon"
           :disabled="isValidating || isTestingTrakt"
-          aria-required="true"
           aria-describedby="trakt-client-id-status trakt-client-id-help"
         />
         <p v-if="errors.trakt_client_id" id="trakt-client-id-status" class="text-xs text-red-400 mt-2 flex items-center gap-1.5 animate-fade-in" role="alert">
@@ -298,11 +296,8 @@ const commonTimezones = [
 
 // Check if we can proceed (basic validation)
 const canProceed = computed(() => {
-  // Trakt Client ID is required
-  if (!localValue.value.trakt_client_id?.trim()) {
-    return false
-  }
-  
+  // Trakt Client ID is optional; only sync settings are required
+
   // Basic validation
   if (localValue.value.sync_interval < 1 || localValue.value.sync_interval > 168) {
     return false
@@ -367,14 +362,16 @@ const testDiscord = async () => {
 
 // Handle next button click - always validate Trakt and Discord if enabled
 const handleNext = async () => {
-  // Always validate Trakt Client ID
-  const traktResult = await testTrakt()
-  
-  // If Trakt validation failed, don't proceed
-  if (!traktResult) {
-    return
+  // Trakt Client ID is optional - only validate it when the user provided one
+  if (localValue.value.trakt_client_id?.trim()) {
+    const traktResult = await testTrakt()
+
+    // If Trakt validation failed, don't proceed
+    if (!traktResult) {
+      return
+    }
   }
-  
+
   // If Discord is enabled, always validate webhook
   if (localValue.value.discord_enabled && localValue.value.discord_webhook?.trim()) {
     const discordResult = await testDiscord()
@@ -386,7 +383,8 @@ const handleNext = async () => {
   }
   
   // Only proceed if validation passes
-  if (canProceed.value && traktValidated.value && (!localValue.value.discord_enabled || discordValidated.value)) {
+  const traktOk = !localValue.value.trakt_client_id?.trim() || traktValidated.value
+  if (canProceed.value && traktOk && (!localValue.value.discord_enabled || discordValidated.value)) {
     emit('next')
   }
 }
