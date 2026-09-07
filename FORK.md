@@ -23,6 +23,7 @@ Trakt-free ID resolution, inspired by [AniPlanrr](https://github.com/noggl/AniPl
 | `list_sync/providers/anilist.py` | Resolution chain is now: Anime-IDs map -> TMDB `/find` (tvdb) -> TMDB `/find` (imdb) -> TMDB title search -> (optional) Trakt if `TRAKT_CLIENT_ID` is set. Also detects AniList `MOVIE` format instead of forcing `tv`. |
 | `list_sync/providers/letterboxd.py` | After scraping a list, fetches each film page and reads the `data-tmdb-id` / `data-tmdb-type` / IMDb link embedded in the HTML (8-way threaded). No API key needed. |
 | `list_sync/main.py` | New **Method 1.5**: IMDb id / title -> TMDB id via `id_resolver` (no Trakt). The Trakt methods (2 & 3) now only run when `TRAKT_CLIENT_ID` is set, avoiding retry/backoff storms. |
+| `listsync-nuxt/components/setup/Step2Configuration.vue`, `api_server.py` | Setup wizard step 2 no longer requires a Trakt Client ID. The field is optional and only format/API-validated when a value is entered. |
 | `.github/workflows/docker-build.yml` | Trimmed to a single `linux/amd64` push to `ghcr.io/<owner>/list-sync` (cluster is amd64). No attestation/SBOM/provenance, no external CI infra. |
 
 ## Env

@@ -41,8 +41,11 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
 
-    # Never publish on PRs, including same-repository PRs.
-    if: github.event_name != 'pull_request'
+    # Publish only from main or v* tags. Excludes PRs (incl. same-repo) and
+    # workflow_dispatch runs targeting any other branch.
+    if: >-
+      github.event_name != 'pull_request' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
 
     # Optional but strongly recommended:
     # configure this environment in repository settings with required reviewers.
