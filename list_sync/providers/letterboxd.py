@@ -4,11 +4,56 @@ Letterboxd provider for ListSync.
 
 import logging
 import re
-from typing import List, Dict, Any
+from concurrent.futures import ThreadPoolExecutor
+from typing import List, Dict, Any, Optional
 
+import requests
 from seleniumbase import SB
 
 from . import register_provider, check_and_raise_if_cancelled, SyncCancelledException
+
+# Letterboxd film pages embed the TMDB id/type directly in the HTML
+# (<body ... data-tmdb-id="496243" data-tmdb-type="movie">). Scraping these
+# lets this fork resolve titles without the Trakt API (VIP-only since
+# 2026-07-30).
+_TMDB_ID_RE = re.compile(r'data-tmdb-id="(\d+)"')
+_TMDB_TYPE_RE = re.compile(r'data-tmdb-type="(movie|tv)"')
+_IMDB_ID_RE = re.compile(r'imdb\.com/title/(tt\d+)')
+_LB_HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) list-sync"}
+
+
+def _resolve_film_ids(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Fetch a single Letterboxd film page and attach tmdb_id / imdb_id."""
+    slug = item.get("slug")
+    if not slug:
+        return item
+    try:
+        resp = requests.get(f"https://letterboxd.com/film/{slug}/", headers=_LB_HEADERS, timeout=20)
+        resp.raise_for_status()
+        html = resp.text
+        tmdb_match = _TMDB_ID_RE.search(html)
+        type_match = _TMDB_TYPE_RE.search(html)
+        imdb_match = _IMDB_ID_RE.search(html)
+        if tmdb_match:
+            item["tmdb_id"] = tmdb_match.group(1)
+        if type_match:
+            item["media_type"] = "tv" if type_match.group(1) == "tv" else "movie"
+        if imdb_match:
+            item["imdb_id"] = imdb_match.group(1)
+    except Exception as exc:  # noqa: BLE001 - per-film best effort
+        logging.debug(f"Letterboxd id resolution failed for {slug}: {exc}")
+    return item
+
+
+def _resolve_all_film_ids(media_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not media_items:
+        return media_items
+    logging.info(f"Resolving TMDB ids for {len(media_items)} Letterboxd films...")
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        resolved = list(pool.map(_resolve_film_ids, media_items))
+    hit = sum(1 for m in resolved if m.get("tmdb_id"))
+    logging.info(f"Letterboxd: resolved {hit}/{len(resolved)} films to a TMDB id")
+    return resolved
 
 
 def _determine_media_type(title: str) -> str:
@@ -255,8 +300,8 @@ def fetch_letterboxd_list(list_id: str) -> List[Dict[str, Any]]:
                     break
             
             logging.info(f"Letterboxd list fetched successfully. Found {len(media_items)} items across {page} pages.")
-            return media_items
-    
+            return _resolve_all_film_ids(media_items)
+
     except SyncCancelledException:
         logging.warning(f"⚠️ Letterboxd list fetch cancelled by user - returning {len(media_items)} items fetched so far")
         raise

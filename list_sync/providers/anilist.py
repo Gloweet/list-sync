@@ -9,7 +9,10 @@ Supports:
 URL Format: https://anilist.co/user/{username}/animelist/{status}
             https://anilist.co/user/{username}/animelist
 
-The provider resolves anime titles to TMDB IDs via Trakt API for Overseerr compatibility.
+The provider resolves each anime's AniList/MAL id to a TMDB id for Overseerr
+compatibility using the Kometa Anime-IDs mapping + TMDB (see anime_ids.py /
+id_resolver.py). This fork no longer depends on the Trakt API, which became
+VIP-only for new API apps on 2026-07-30.
 """
 
 import logging
@@ -17,7 +20,14 @@ import re
 import requests
 from typing import Dict, Any, List, Optional
 from . import register_provider
-from .trakt import search_trakt_by_title
+from . import anime_ids
+from . import id_resolver
+from ..config import get_trakt_client_id
+
+try:  # Trakt stays as an optional last-resort resolver if a client id is present
+    from .trakt import search_trakt_by_title
+except Exception:  # noqa: BLE001
+    search_trakt_by_title = None
 
 # AniList GraphQL API endpoint
 ANILIST_GRAPHQL_URL = "https://graphql.anilist.co"
@@ -229,15 +239,19 @@ def extract_media_from_anilist_entry(entry: Dict[str, Any]) -> Optional[Dict[str
         
         # Get year
         year = media.get("startDate", {}).get("year")
-        
-        # AniList IDs (for reference, not used for Overseerr)
+
+        # AniList IDs used to resolve a TMDB id downstream
         anilist_id = media.get("id")
         mal_id = media.get("idMal")
-        
+
+        # AniList format: TV, TV_SHORT, MOVIE, SPECIAL, OVA, ONA, MUSIC
+        anilist_format = (media.get("format") or "").upper()
+        media_type = "movie" if anilist_format == "MOVIE" else "tv"
+
         return {
             "title": title,
             "year": year,
-            "media_type": "tv",  # AniList anime is always TV type for Overseerr
+            "media_type": media_type,
             "anilist_id": anilist_id,
             "mal_id": mal_id,
             "title_english": title_english,
@@ -252,7 +266,8 @@ def extract_media_from_anilist_entry(entry: Dict[str, Any]) -> Optional[Dict[str
 @register_provider("anilist")
 def fetch_anilist_list(list_id: str) -> List[Dict[str, Any]]:
     """
-    Fetch anime list from AniList and resolve to TMDB IDs via Trakt.
+    Fetch anime list from AniList and resolve each entry to a TMDB ID
+    (Anime-IDs mapping -> TMDB /find, with a TMDB title-search fallback).
     
     This is the main entry point for the AniList provider, decorated with @register_provider.
     
@@ -280,49 +295,76 @@ def fetch_anilist_list(list_id: str) -> List[Dict[str, Any]]:
         logging.warning(f"No entries found for AniList user '{username}'")
         return []
     
+    trakt_available = bool(get_trakt_client_id()) and search_trakt_by_title is not None
+
     # Extract and normalize media items
     media_items = []
-    
+
     for entry in entries:
         media = extract_media_from_anilist_entry(entry)
-        
+
         if not media:
             continue
-        
+
         title = media["title"]
         year = media.get("year")
-        
-        # Try to resolve TMDB ID via Trakt API
-        # Try English title first, then Romaji if English fails
+        media_type = media.get("media_type", "tv")
+        anilist_id = media.get("anilist_id")
+        mal_id = media.get("mal_id")
+
         tmdb_id = None
         imdb_id = None
-        
-        # Attempt 1: English title
-        if media.get("title_english"):
-            trakt_result = search_trakt_by_title(media["title_english"], year, "tv")
-            if trakt_result and trakt_result.get("tmdb_id"):
-                tmdb_id = trakt_result["tmdb_id"]
-                imdb_id = trakt_result.get("imdb_id")
-                logging.debug(f"  ✓ Resolved via English title: {title} -> TMDB {tmdb_id}")
-        
-        # Attempt 2: Romaji title (if English failed)
-        if not tmdb_id and media.get("title_romaji") and media["title_romaji"] != media.get("title_english"):
-            trakt_result = search_trakt_by_title(media["title_romaji"], year, "tv")
-            if trakt_result and trakt_result.get("tmdb_id"):
-                tmdb_id = trakt_result["tmdb_id"]
-                imdb_id = trakt_result.get("imdb_id")
-                logging.debug(f"  ✓ Resolved via Romaji title: {title} -> TMDB {tmdb_id}")
-        
-        # Add to results
+        resolved_via = None
+
+        # 1) AniList/MAL id -> TVDB/IMDb id via the Kometa Anime-IDs mapping
+        mapped = anime_ids.lookup(anilist_id=anilist_id, mal_id=mal_id)
+        imdb_id = mapped.get("imdb_id")
+
+        # 2) TVDB id -> TMDB id (shows)
+        if mapped.get("tvdb_id"):
+            hit = id_resolver.resolve_by_tvdb_id(mapped["tvdb_id"])
+            if hit:
+                tmdb_id, media_type, resolved_via = hit["tmdb_id"], hit["media_type"], "tvdb"
+
+        # 3) IMDb id -> TMDB id (mostly movies)
+        if not tmdb_id and imdb_id:
+            hit = id_resolver.resolve_by_imdb_id(imdb_id, prefer=media_type)
+            if hit:
+                tmdb_id, media_type, resolved_via = hit["tmdb_id"], hit["media_type"], "imdb"
+
+        # 4) Title/year search on TMDB (English then Romaji)
+        if not tmdb_id:
+            for cand in (media.get("title_english"), media.get("title_romaji")):
+                if not cand:
+                    continue
+                hit = id_resolver.resolve_by_title(cand, year, media_type)
+                if hit:
+                    tmdb_id, resolved_via = hit["tmdb_id"], "tmdb-search"
+                    break
+
+        # 5) Legacy Trakt path, only if a client id is configured
+        if not tmdb_id and trakt_available:
+            for cand in (media.get("title_english"), media.get("title_romaji")):
+                if not cand:
+                    continue
+                trakt_result = search_trakt_by_title(cand, year, "tv")
+                if trakt_result and trakt_result.get("tmdb_id"):
+                    tmdb_id = trakt_result["tmdb_id"]
+                    imdb_id = imdb_id or trakt_result.get("imdb_id")
+                    resolved_via = "trakt"
+                    break
+
+        if tmdb_id:
+            logging.debug(f"  ✓ {title} -> TMDB {tmdb_id} [{media_type}] via {resolved_via}")
+
         media_items.append({
             "title": title,
             "year": year,
-            "media_type": "tv",
+            "media_type": media_type,
             "tmdb_id": tmdb_id,
             "imdb_id": imdb_id,
-            # Keep AniList metadata for reference
-            "anilist_id": media.get("anilist_id"),
-            "mal_id": media.get("mal_id"),
+            "anilist_id": anilist_id,
+            "mal_id": mal_id,
         })
         
         # Log progress periodically
