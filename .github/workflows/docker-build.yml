@@ -41,8 +41,11 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
 
-    # Never publish on PRs, including same-repository PRs.
-    if: github.event_name != 'pull_request'
+    # Publish only from main or v* tags. Excludes PRs (incl. same-repo) and
+    # workflow_dispatch runs targeting any other branch.
+    if: >-
+      github.event_name != 'pull_request' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
 
     # Optional but strongly recommended:
     # configure this environment in repository settings with required reviewers.
@@ -73,7 +76,6 @@ jobs:
           images: ghcr.io/${{ steps.repo.outputs.owner }}/list-sync
           tags: |
             type=raw,value=main,enable={{is_default_branch}}
-            type=ref,event=branch
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
           flavor: latest=false
