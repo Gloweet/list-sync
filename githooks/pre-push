@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# pre-push hook: refuse any push toward the UPSTREAM (original) list-sync repo.
+#
+# This fork is published to github.com/Gloweet/list-sync. The `upstream`
+# remote (github.com/Woahai321/list-sync) is read-only reference material —
+# it must never receive a push, and PRs against it must never be opened.
+#
+# Setup (committed so every clone can enable it):
+#   git config core.hooksPath githooks
+#
+# The hook is deliberately redundant: even if someone runs
+# `git push upstream ...` / `gh pr create -R Woahai321/list-sync`, the
+# destination is checked here and the push is aborted.
+
+# stdin lines: <local ref> <local sha> <remote ref> <remote sha>
+# argv: [remote-name] [remote-url]
+remote_name="${1:-}"
+remote_url="${2:-}"
+
+blocked() {
+  echo "=============================================================="
+  echo "  BLOCKED by githooks/pre-push"
+  echo "  Push to '$remote_name' ($remote_url) refused:"
+  echo
+  echo "  '$remote_name' resolves to the ORIGINAL upstream repo"
+  echo "  (Woahai321/list-sync). This fork is Gloweet/list-sync —"
+  echo "  pushes and PRs must always target OUR fork (origin)."
+  echo
+  echo "  If you really need to touch upstream, push to a local branch"
+  echo "  and open a PR via a pull-request against the upstream via the"
+  echo "  GitHub web UI on a personal fork - never via this remote."
+  echo "=============================================================="
+  exit 1
+}
+
+# Block by remote name or by URL.
+case "$remote_name" in
+  upstream) blocked ;;
+esac
+
+if [[ "$remote_url" == *Woahai321* ]] || [[ "$remote_url" == *woahai321* ]] \
+  || [[ "$remote_url" == "https://github.com/Woahai321/list-sync.git" ]] \
+  || [[ "$remote_url" == "https://github.com/Woahai321/list-sync" ]]; then
+  blocked
+fi
+
+exit 0

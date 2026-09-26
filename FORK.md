@@ -68,3 +68,14 @@ that don't already carry a TMDB id fall back to Overseerr's fuzzy search.
 git remote add upstream https://github.com/Woahai321/list-sync.git   # once
 git fetch upstream && git merge upstream/main
 ```
+
+## Guardrails
+
+This fork must never push to / open PRs against the original repo
+(`Woahai321/list-sync`). Protection is layered:
+
+- **`githooks/pre-push`** (committed) refuses any `git push` whose remote
+  name is `upstream` or whose URL points at `Woahai321`. Enable it on any
+  clone with `git config core.hooksPath githooks`.
+- **`gh` defaults** to `Gloweet/list-sync` (`gh repo set-default`).
+- The fork's `main` is branch-protected (PR review required) on GitHub.
