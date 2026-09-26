@@ -211,6 +211,50 @@ def get_tvdb_api_key() -> Optional[str]:
     return api_key
 
 
+def get_babelio_credentials() -> Tuple[Optional[str], Optional[str]]:
+    """
+    Get Babelio (babelio.com) login credentials from environment variables.
+    
+    Returns:
+        Tuple[Optional[str], Optional[str]]: Email and password, or (None, None) if unset
+    """
+    if os.path.exists('.env'):
+        load_dotenv()
+    
+    email = os.getenv('BABELIO_EMAIL')
+    password = os.getenv('BABELIO_PASSWORD')
+    import logging
+    if email and password:
+        logging.info("Babelio credentials loaded from environment")
+    else:
+        logging.warning("BABELIO_EMAIL/BABELIO_PASSWORD not set - Babelio provider will not work")
+    
+    return email, password
+
+
+def get_shelfmark_config() -> Tuple[Optional[str], Optional[str]]:
+    """
+    Get Shelfmark (https://github.com/calibrain/shelfmark) URL and admin API
+    key from environment variables. Shelfmark is the book-request target for
+    the Babelio provider (the book equivalent of Overseerr for movies/TV).
+    
+    Returns:
+        Tuple[Optional[str], Optional[str]]: Base URL and API key, or (None, None) if unset
+    """
+    if os.path.exists('.env'):
+        load_dotenv()
+    
+    url = os.getenv('SHELFMARK_URL')
+    api_key = os.getenv('SHELFMARK_API_KEY')
+    import logging
+    if url and api_key:
+        logging.info("Shelfmark configuration loaded from environment")
+    else:
+        logging.warning("SHELFMARK_URL/SHELFMARK_API_KEY not set - book sync will be skipped")
+    
+    return url, api_key
+
+
 def load_env_config() -> Tuple[Optional[str], Optional[str], Optional[str], float, bool, bool]:
     """
     Load configuration from database or environment variables (database preferred).
@@ -383,6 +427,17 @@ def load_env_lists() -> bool:
                 add_list_if_new("stevenlu", "stevenlu")
                 if (("stevenlu", "stevenlu") not in existing_set):
                     logging.info("Steven Lu popular movies list configured")
+        
+        # Process Babelio lists (always the authenticated account's own library -
+        # there is no "list ID" to configure, just enable it, gated on credentials)
+        babelio_lists = get_list_setting('babelio_lists')
+        babelio_email = get_list_setting('babelio_email') or os.getenv('BABELIO_EMAIL', '')
+        babelio_password = get_list_setting('babelio_password') or os.getenv('BABELIO_PASSWORD', '')
+        if babelio_lists and 'mabibliotheque' in babelio_lists.lower():
+            if babelio_email and babelio_password:
+                add_list_if_new("mabibliotheque", "babelio")
+            else:
+                logging.warning("BABELIO_LISTS configured but BABELIO_EMAIL/BABELIO_PASSWORD missing. Skipping Babelio provider.")
         
         # Process TMDB lists
         if tmdb_lists := get_list_setting('tmdb_lists'):

@@ -108,6 +108,7 @@ def _import_all_providers():
         from . import tvdb
         from . import anilist
         from . import collections
+        from . import babelio
     except ImportError as e:
         import logging
         logging.warning(f"Could not import all providers: {e}")

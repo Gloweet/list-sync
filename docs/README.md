@@ -16,6 +16,7 @@ Welcome to the comprehensive documentation for ListSync - an automated media lis
 ### 🔧 Technical Documentation
 - **[API Documentation](api.md)** - Complete REST API reference
 - **[Architecture Overview](architecture.md)** - Technical architecture and design
+- **[Babelio → Shelfmark (fork)](babelio-shelfmark.md)** - Book-sync integration and the fixes required to make it work (Babelio WAF, Shelfmark API key, cluster/gitops and download-source config)
 
 ### 👥 Developer Resources
 - **[Contributing Guide](contributing.md)** - Development setup and contribution workflow

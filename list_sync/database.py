@@ -241,6 +241,21 @@ def init_database():
         except sqlite3.OperationalError:
             pass
 
+        # Add author + external_id columns for non-Overseerr media types (e.g. books
+        # synced to Shelfmark, which has no TMDB/IMDb id). external_id is a
+        # provider-prefixed string such as "hardcover:427363".
+        try:
+            cursor.execute('ALTER TABLE synced_items ADD COLUMN author TEXT')
+            logging.info("Added author column to synced_items table")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute('ALTER TABLE synced_items ADD COLUMN external_id TEXT')
+            logging.info("Added external_id column to synced_items table")
+        except sqlite3.OperationalError:
+            pass
+
         # Add poster columns to lists if they don't exist
         try:
             cursor.execute('ALTER TABLE lists ADD COLUMN poster_url TEXT')
@@ -611,13 +626,26 @@ def should_sync_item(overseerr_id: int) -> bool:
         return result is None
 
 
-def save_sync_result(title: str, media_type: str, imdb_id: Optional[str], overseerr_id: Optional[int], status: str, year: Optional[int] = None, tmdb_id: Optional[str] = None, list_type: Optional[str] = None, list_id: Optional[str] = None):
+def should_sync_book(external_id: str) -> bool:
+    """Check if a book should be synced based on last sync time (mirrors should_sync_item)."""
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT last_synced FROM synced_items
+            WHERE external_id = ?
+            AND last_synced > datetime('now', '-48 hours')
+        ''', (external_id,))
+        result = cursor.fetchone()
+        return result is None
+
+
+def save_sync_result(title: str, media_type: str, imdb_id: Optional[str], overseerr_id: Optional[int], status: str, year: Optional[int] = None, tmdb_id: Optional[str] = None, list_type: Optional[str] = None, list_id: Optional[str] = None, external_id: Optional[str] = None, author: Optional[str] = None):
     """
     Save the result of a sync operation and track which list(s) it came from.
     
     Args:
         title: Media title
-        media_type: Media type (movie/tv)
+        media_type: Media type (movie/tv/book)
         imdb_id: IMDb ID
         overseerr_id: Overseerr ID
         status: Sync status
@@ -625,6 +653,10 @@ def save_sync_result(title: str, media_type: str, imdb_id: Optional[str], overse
         tmdb_id: TMDB ID
         list_type: Type of list this item came from (e.g., 'imdb', 'trakt')
         list_id: ID of the list this item came from
+        external_id: Non-Overseerr identity for other targets (e.g. Shelfmark
+            "{provider}:{provider_id}" for books). Used to key skip/skip-window
+            lookups when overseerr_id/imdb_id/tmdb_id don't apply.
+        author: Book author (books only)
     """
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
@@ -654,6 +686,13 @@ def save_sync_result(title: str, media_type: str, imdb_id: Optional[str], overse
             if existing:
                 item_db_id = existing[0]
         
+        # If still not found, try external_id (books/Shelfmark)
+        if not item_db_id and external_id:
+            cursor.execute('SELECT id FROM synced_items WHERE external_id = ?', (external_id,))
+            existing = cursor.fetchone()
+            if existing:
+                item_db_id = existing[0]
+        
         if status == "skipped":
             # For skipped items, only insert if it doesn't exist (don't update last_synced)
             if item_db_id:
@@ -661,16 +700,16 @@ def save_sync_result(title: str, media_type: str, imdb_id: Optional[str], overse
                 cursor.execute('''
                     UPDATE synced_items 
                     SET status = ?, title = ?, media_type = ?, year = ?, imdb_id = ?, tmdb_id = ?,
-                        source_list_type = ?, source_list_id = ?
+                        source_list_type = ?, source_list_id = ?, external_id = ?, author = ?
                     WHERE id = ?
-                ''', (status, title, media_type, year, imdb_id, tmdb_id, list_type, list_id, item_db_id))
+                ''', (status, title, media_type, year, imdb_id, tmdb_id, list_type, list_id, external_id, author, item_db_id))
             else:
                 # Insert new item
                 cursor.execute('''
                     INSERT INTO synced_items 
-                    (title, media_type, year, imdb_id, tmdb_id, overseerr_id, status, last_synced, source_list_type, source_list_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
-                ''', (title, media_type, year, imdb_id, tmdb_id, overseerr_id, status, list_type, list_id))
+                    (title, media_type, year, imdb_id, tmdb_id, overseerr_id, status, last_synced, source_list_type, source_list_id, external_id, author)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?)
+                ''', (title, media_type, year, imdb_id, tmdb_id, overseerr_id, status, list_type, list_id, external_id, author))
                 item_db_id = cursor.lastrowid
         else:
             # For non-skipped items, update last_synced timestamp
@@ -680,16 +719,16 @@ def save_sync_result(title: str, media_type: str, imdb_id: Optional[str], overse
                     UPDATE synced_items 
                     SET title = ?, media_type = ?, year = ?, imdb_id = ?, tmdb_id = ?, 
                         overseerr_id = ?, status = ?, last_synced = CURRENT_TIMESTAMP,
-                        source_list_type = ?, source_list_id = ?
+                        source_list_type = ?, source_list_id = ?, external_id = ?, author = ?
                     WHERE id = ?
-                ''', (title, media_type, year, imdb_id, tmdb_id, overseerr_id, status, list_type, list_id, item_db_id))
+                ''', (title, media_type, year, imdb_id, tmdb_id, overseerr_id, status, list_type, list_id, external_id, author, item_db_id))
             else:
                 # Insert new item
                 cursor.execute('''
                     INSERT INTO synced_items 
-                    (title, media_type, year, imdb_id, tmdb_id, overseerr_id, status, last_synced, source_list_type, source_list_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
-                ''', (title, media_type, year, imdb_id, tmdb_id, overseerr_id, status, list_type, list_id))
+                    (title, media_type, year, imdb_id, tmdb_id, overseerr_id, status, last_synced, source_list_type, source_list_id, external_id, author)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?)
+                ''', (title, media_type, year, imdb_id, tmdb_id, overseerr_id, status, list_type, list_id, external_id, author))
                 item_db_id = cursor.lastrowid
         
         # Link item to list(s) if list information provided

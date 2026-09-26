@@ -340,6 +340,10 @@ def construct_list_url(list_type: str, list_id: str) -> str:
             # If it's already a URL, return as is
             return list_id
     
+    elif list_type.lower() == "babelio":
+        # Babelio lists are always the authenticated account's own library
+        return "https://www.babelio.com/mabibliotheque.php"
+    
     elif list_type.lower() == "collections":
         # Collections don't have URLs, return a descriptive identifier
         return f"collection:{list_id}"

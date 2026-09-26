@@ -14,13 +14,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Any, Optional, Tuple
 
 from .api.overseerr import OverseerrClient
+from .api.shelfmark import ShelfmarkClient
 from .config import (
     load_config, load_env_config, load_env_lists, save_config,
-    CONFIG_FILE, get_trakt_client_id
+    CONFIG_FILE, get_trakt_client_id, get_shelfmark_config
 )
 from .database import (
     init_database, load_list_ids, save_list_id, delete_list,
-    load_sync_interval, configure_sync_interval, should_sync_item,
+    load_sync_interval, configure_sync_interval, should_sync_item, should_sync_book,
     save_sync_result, update_list_item_count, update_list_sync_info, DB_FILE,
     start_sync_in_db, end_sync_in_db, add_item_to_sync, update_sync_lists_in_db
 )
@@ -768,6 +769,232 @@ def process_media_item(item: Dict[str, Any], overseerr_client: OverseerrClient, 
         return result
 
 
+def _pick_best_book(matches: List[Dict[str, Any]], author: Optional[str]) -> Dict[str, Any]:
+    """
+    Pick the best metadata match for a book. Shelfmark's provider search is
+    already relevance-ranked, so this defaults to matches[0], but when we know
+    the author (from Babelio) we prefer the first result whose author list
+    fuzzy-matches - cheap insurance against a title-only search returning a
+    same-named book by someone else.
+    """
+    if not author or len(matches) <= 1:
+        return matches[0]
+
+    from .utils.helpers import calculate_title_similarity
+
+    def author_similarity(candidate: Dict[str, Any]) -> float:
+        candidate_authors = candidate.get("authors") or candidate.get("author") or []
+        if isinstance(candidate_authors, str):
+            candidate_authors = [candidate_authors]
+        best = max(
+            (calculate_title_similarity(author, ca) for ca in candidate_authors if ca),
+            default=0.0,
+        )
+        return best
+
+    ranked = sorted(matches, key=author_similarity, reverse=True)
+    if author_similarity(ranked[0]) >= 0.6:
+        return ranked[0]
+    return matches[0]
+
+
+def process_book_item(item: Dict[str, Any], shelfmark_client: ShelfmarkClient, dry_run: bool) -> Dict[str, Any]:
+    """
+    Process a single book item for sync to Shelfmark.
+
+    Workflow:
+    1. Search Shelfmark's configured metadata providers for the book (title + author)
+    2. List releases for the best-matching result
+    3. Queue the first available release for download
+
+    Unlike movies/TV there is no "already available" / "already requested"
+    check against a library: Shelfmark is a search & download tool, not a
+    library manager (see its README "Project Scope" section). A book is
+    either matched and queued, or it isn't.
+
+    Args:
+        item (Dict[str, Any]): Book item (title, author, year, ...) from the Babelio provider
+        shelfmark_client (ShelfmarkClient): Shelfmark API client
+        dry_run (bool): Whether to perform a dry run
+
+    Returns:
+        Dict[str, Any]: Processing result
+    """
+    title = item.get('title', 'Unknown Title').strip()
+    author = item.get('author')
+    year = item.get('year')
+
+    logging.info(f"📚 PROCESSING BOOK: '{title}'" + (f" by {author}" if author else ""))
+
+    result = {
+        "title": title,
+        "year": year,
+        "media_type": "book",
+        "error_message": None,
+    }
+
+    if dry_run:
+        result["status"] = "would_be_synced"
+        return result
+
+    source_lists = get_source_lists_from_item(item)
+
+    def _save(status: str, external_id: Optional[str] = None):
+        for source_list in source_lists:
+            save_sync_result(
+                title=title, media_type="book", imdb_id=None, overseerr_id=None,
+                status=status, year=year, tmdb_id=None,
+                list_type=source_list['type'], list_id=source_list['id'],
+                external_id=external_id, author=author,
+            )
+
+    query = title
+
+    try:
+        # Open Library (the configured Shelfmark metadata provider) matches far
+        # better on the bare title than on "title author" (the concatenated
+        # form returns 0 results), so search title-first and only retry with
+        # the author appended when the title alone matches nothing.
+        matches = shelfmark_client.search_metadata(query)
+        if matches is None:
+            logging.warning(f"⚠️  Shelfmark: search failed (unreachable or auth error) for '{query}'")
+            _save("error")
+            result["status"] = "error"
+            result["error_message"] = f"Shelfmark search failed for '{query}'"
+            return result
+        if not matches and author:
+            query = f"{title} {author}"
+            logging.info(f"🔎  Shelfmark: no title-only match, retrying with '{query}'")
+            matches = shelfmark_client.search_metadata(query)
+            if matches is None:
+                logging.warning(f"⚠️  Shelfmark: retry search failed for '{query}'")
+                _save("error")
+                result["status"] = "error"
+                result["error_message"] = f"Shelfmark search failed for '{query}'"
+                return result
+        if not matches:
+            logging.warning(f"⚠️  Shelfmark: no metadata match for '{query}'")
+            _save("not_found")
+            result["status"] = "not_found"
+            return result
+
+        best = _pick_best_book(matches, author)
+        provider = best.get("provider")
+        provider_id = best.get("provider_id")
+        if not provider or not provider_id:
+            logging.warning(f"⚠️  Shelfmark: match for '{query}' missing provider/provider_id: {best}")
+            _save("not_found")
+            result["status"] = "not_found"
+            return result
+
+        external_id = f"{provider}:{provider_id}"
+
+        if not should_sync_book(external_id):
+            logging.info(f"⏭️  SKIP: '{title}' recently synced (within skip window)")
+            _save("skipped", external_id=external_id)
+            result["status"] = "skipped"
+            return result
+
+        releases = shelfmark_client.get_releases(provider, provider_id, content_type="ebook")
+        if releases is None:
+            logging.warning(f"⚠️  Shelfmark: release search failed for '{title}' ({external_id}) - not an availability answer")
+            _save("error", external_id=external_id)
+            result["status"] = "error"
+            result["error_message"] = f"Shelfmark release search failed for '{title}'"
+            return result
+        if not releases:
+            logging.warning(f"⚠️  Shelfmark: no releases found for '{title}' ({external_id})")
+            _save("not_found", external_id=external_id)
+            result["status"] = "not_found"
+            return result
+
+        release = releases[0]
+
+        queued = shelfmark_client.download_release(release)
+        status = "requested" if queued else "request_failed"
+        logging.info(f"{'✅ SUCCESS' if queued else '❌ ERROR'}: Shelfmark download {'queued' if queued else 'failed'} for '{title}'")
+        _save(status, external_id=external_id)
+        result["status"] = status
+        return result
+
+    except Exception as e:
+        logging.error(f"❌ ERROR: Exception during book processing: {str(e)}")
+        result["status"] = "error"
+        result["error_message"] = str(e)
+        try:
+            _save("error")
+        except Exception as save_error:
+            logging.error(f"Failed to save book error status: {save_error}")
+        return result
+
+
+def sync_books_to_shelfmark(
+    book_items: List[Dict[str, Any]],
+    shelfmark_client: Optional[ShelfmarkClient],
+    sync_results: SyncResults,
+    dry_run: bool = False,
+) -> None:
+    """
+    Sync book items to Shelfmark, mutating `sync_results` in place so the
+    rest of the summary/display/Discord code doesn't need to know about
+    books specially.
+
+    Args:
+        book_items (List[Dict[str, Any]]): Book items (media_type == "book")
+        shelfmark_client (Optional[ShelfmarkClient]): Shelfmark API client, or
+            None if SHELFMARK_URL/SHELFMARK_API_KEY aren't configured
+        sync_results (SyncResults): Sync results to update in place
+        dry_run (bool): Whether to perform a dry run
+    """
+    if not book_items:
+        return
+
+    if shelfmark_client is None:
+        logging.warning(
+            f"⚠️  {len(book_items)} book item(s) found but SHELFMARK_URL/SHELFMARK_API_KEY "
+            "are not configured - skipping book sync"
+        )
+        print(color_gradient(
+            f"⚠️   {len(book_items)} book(s) found but Shelfmark isn't configured (SHELFMARK_URL/SHELFMARK_API_KEY) - skipped",
+            "#ffaa00", "#ff5500"
+        ))
+        for item in book_items:
+            sync_results.results["error"] = sync_results.results.get("error", 0) + 1
+            sync_results.error_items.append({"title": item.get('title', 'Unknown'), "error": "Shelfmark not configured"})
+            sync_results.media_type_counts["book"] = sync_results.media_type_counts.get("book", 0) + 1
+        return
+
+    print(f"\n📚  Processing {len(book_items)} book items...")
+    for i, item in enumerate(book_items, 1):
+        if check_cancellation_requested():
+            logging.warning(f"⚠️ Cancellation detected during book processing at item {i}/{len(book_items)}")
+            break
+
+        try:
+            result = process_book_item(item, shelfmark_client, dry_run)
+            status = result["status"]
+        except Exception as e:
+            logging.error(f"❌ ERROR: Exception during book processing: {str(e)}")
+            status = "error"
+            result = {"title": item.get('title', 'Unknown'), "year": item.get('year'), "error_message": str(e)}
+
+        sync_results.results[status] = sync_results.results.get(status, 0) + 1
+        sync_results.media_type_counts["book"] = sync_results.media_type_counts.get("book", 0) + 1
+
+        title = item.get('title', 'Unknown')
+        if status == "requested":
+            print(f"✅ {title}: Successfully Requested ({i}/{len(book_items)})")
+        elif status == "skipped":
+            print(f"⏭️  {title}: Skipped ({i}/{len(book_items)})")
+        elif status == "not_found":
+            print(f"❓ {title}: Not Found ({i}/{len(book_items)})")
+            sync_results.not_found_items.append({"title": title, "year": item.get('year')})
+        else:
+            print(f"❓ {title}: {status} ({i}/{len(book_items)})")
+            if status in ("error", "request_failed"):
+                sync_results.error_items.append({"title": title, "error": result.get("error_message", "Unknown error")})
+
+
 def sync_media_to_overseerr(
     media_items: List[Dict[str, Any]],
     overseerr_client: OverseerrClient,
@@ -797,7 +1024,17 @@ def sync_media_to_overseerr(
     sync_results.synced_lists = synced_lists or []
     current_item = 0
 
-    print(f"\n🎬  Processing {sync_results.total_items} media items...")
+    # Books go to Shelfmark, not Overseerr (different matching/status model
+    # entirely - see process_book_item). Split them out here so every caller
+    # of sync_media_to_overseerr gets book support for free.
+    book_items = [item for item in media_items if item.get('media_type') == 'book']
+    if book_items:
+        media_items = [item for item in media_items if item.get('media_type') != 'book']
+        shelfmark_url, shelfmark_api_key = get_shelfmark_config()
+        shelfmark_client = ShelfmarkClient(shelfmark_url, shelfmark_api_key) if (shelfmark_url and shelfmark_api_key) else None
+        sync_books_to_shelfmark(book_items, shelfmark_client, sync_results, dry_run=dry_run)
+
+    print(f"\n🎬  Processing {len(media_items)} media items...")
     
     # Intelligent batching for optimal performance with readable logs
     batch_size = int(os.getenv('LISTSYNC_BATCH_SIZE', '3') or '3')  # Default batch size of 3

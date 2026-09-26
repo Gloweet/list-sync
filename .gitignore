@@ -252,6 +252,9 @@ ENV/
 env.bak/
 venv.bak/
 
+# Runtime data (SQLite DB, logs, cached browser sessions - contains live cookies)
+data/
+
 # Spyder project settings
 .spyderproject
 .spyproject
