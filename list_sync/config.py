@@ -255,10 +255,16 @@ def get_shelfmark_config() -> Tuple[Optional[str], Optional[str]]:
     return url, api_key
 
 
-def load_env_config() -> Tuple[Optional[str], Optional[str], Optional[str], float, bool, bool]:
+def load_env_config(test_connection: bool = True) -> Tuple[Optional[str], Optional[str], Optional[str], float, bool, bool]:
     """
     Load configuration from database or environment variables (database preferred).
-    
+
+    Args:
+        test_connection: When True (default), only return the config if Overseerr
+            answers /api/v1/status. Startup code passes False so a temporarily
+            unreachable Overseerr does not look like a missing configuration
+            (which used to fall through to the interactive setup prompt).
+
     Returns:
         Tuple: Overseerr URL, API key, user ID, sync interval (float), automated mode flag, 4K flag
     """
@@ -299,6 +305,9 @@ def load_env_config() -> Tuple[Optional[str], Optional[str], Optional[str], floa
         
         # Only return the config if required variables are present
         if url and api_key:
+            if not test_connection:
+                logging.info("Configuration loaded from database (connection check deferred)")
+                return url, api_key, user_id, sync_interval, automated_mode, is_4k
             try:
                 # Test the API connection
                 test_overseerr_api(url, api_key)
@@ -332,6 +341,9 @@ def load_env_config() -> Tuple[Optional[str], Optional[str], Optional[str], floa
         
         # Only return the config if required variables are present
         if url and api_key:
+            if not test_connection:
+                logging.info("Configuration loaded from environment variables (connection check deferred)")
+                return url, api_key, user_id, float(sync_interval), automated_mode, is_4k
             try:
                 # Test the API connection
                 test_overseerr_api(url, api_key)

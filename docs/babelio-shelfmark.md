@@ -67,16 +67,30 @@ even the homepage. The challenge is a server-side gate, not a cookie check.
 - Login via SeleniumBase in undetected-chromedriver mode (`SB(uc=True)`).
 - The login page is **`/connection.php`**, not `/connexion.php` (the latter is
   a 404 "Page blanche").
-- The login form fields are `name="Login"`, `name="Password"`, submit
-  `name="sub_btn"`.
+- The login form fields are `name="Login"`, `name="Password"`. The submit
+  control is a **`<button name="sub_btn">Se connecter</button>`**, not an
+  `<input name="sub_btn">` — see fix #6.
 - A full-screen **appconsent cookie banner** (iframe) blocks the submit
-  button → dismissed by clicking *"Continue without accepting"* first.
-- The slider captcha is flaky (appears on ~1 run in 2) → `ActionChains`
-  humanised drag, retried up to 3× with page-state diagnostics logged
-  (`_log_page_state`).
+  button → dismissed by clicking *"Continue without accepting"* first, then
+  waiting for the iframe to disappear.
+- The slider captcha is flaky → `ActionChains` humanised drag, retried up to
+  3× with page-state diagnostics logged (`_log_page_state`). The drag target
+  is now the track's right edge (not just `data-drag-distance`, which sizes
+  the fill bar and can leave the thumb a few pixels short).
 - Successful session cookies are cached to `data/babelio_session.json`;
   subsequent runs reuse them (verified: second run does a plain `requests`
   fetch, no Selenium).
+
+**Dead ends checked on 2026-10-30 (do not re-litigate):**
+- **byparr** (FlareSolverr-compatible, used by Shelfmark) answers the Babelio
+  WAF with a 200 + cookies, but the body is still the custom
+  `/js/rcaptcha.js` drag challenge. It only knows Cloudflare-style
+  challenges, so it cannot solve Babelio's slider.
+- **Tor** (`arr/tor`, SOCKS 9050 / HTTP 8118) also gets the same 403
+  challenge, so routing Selenium through it buys nothing (and it is slower).
+- The WAF re-challenges aggressively after repeated logins. Hammering it
+  from one egress IP temporarily turns 403 into connection timeouts; back off
+  instead of adding retries in a tight loop.
 
 ### 2. Shelfmark API key rejected with 401
 
@@ -192,6 +206,46 @@ hit = the exact book, `La.petite.bonne.Berenice.Pichat.2024.FR.[EPUB`), from
 Prowlarr indexers (which recovered) + libgen. `process_book_item` reports
 `status=requested` and the POST `/api/releases/download` succeeds, handing
 the torrent to qBittorrent (`book` category).
+
+### 6. Babelio login never submitted (picked the header search button)
+
+**Symptom:** after 2026-10-28 the slider was solved (the login form appeared),
+but every attempt ended with `no id_user cookie` and the login page still
+displayed. The provider retried 3× and recorded 0 books.
+
+**Root cause:** the submit control changed to
+`<button type="submit" name="sub_btn">Se connecter</button>`, but the code
+looked for `input[name='sub_btn']` first. It then fell back to a **global**
+`button[type='submit']` lookup, which matches the header's search button
+*before* the login button. So it clicked the search icon (or the click was
+intercepted by the consent iframe) and never POSTed the credentials.
+
+**Fix:** scope every lookup to `form[action*='connection.php']`, and submit
+with `form.submit()` (proven to work end-to-end: id_user cookie set, then
+`mabibliotheque.php` returns 200 with the library). The button click path
+sometimes navigates through `/captcha.php` and blocks ChromeDriver for its
+full 120s read timeout. Also wait for the login form to appear and for
+`id_user` up to 10s instead of using fixed sleeps.
+
+### 7. list-sync fell into the interactive prompt on boot
+
+**Symptom:** pod "healthy" (health endpoint on the API process still answers)
+but no sync ever ran; `list_sync.log` ended at
+`🔑 No saved credentials found. Let's set up your Overseerr connection.`
+
+**Root cause:** `load_env_config()` tests Overseerr's `/api/v1/status` and
+returns `None` when it fails. On 2026-10-30 Seerr was still starting
+(`ECONNREFUSED`), so the config looked missing and the process dropped into
+`get_credentials()` — an interactive prompt with no TTY, where it idled.
+
+**Fix:**
+- Code: startup reads config with `load_env_config(test_connection=False)`;
+  in automated mode it retries Overseerr with exponential backoff (5s → 60s)
+  and never falls through to the interactive menu. A sync failure exits for
+  supervisor to restart instead of blocking on `input()`.
+- Cluster: `apps/base/arr/list-sync/deployment.yaml` gained an init container
+  `wait-for-seerr` that polls `http://seerr.seerr.svc.cluster.local/api/v1/status`
+  before the app starts.
 
 ---
 

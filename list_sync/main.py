@@ -192,8 +192,9 @@ def initialize_sync_interval():
             logging.info(f"Using existing sync interval from database: {db_interval} hours")
             return db_interval
         
-        # No database interval, check environment 
-        _, _, _, env_interval, _, _ = load_env_config()
+        # No database interval, check environment. Do not require Overseerr to be
+        # reachable just to read the configured interval.
+        _, _, _, env_interval, _, _ = load_env_config(test_connection=False)
         
         if env_interval > 0:
             # Save environment interval to database
@@ -1976,19 +1977,48 @@ def main():
         display_ascii_art()
         display_banner()
         
-        # Check for Docker environment variables
-        url, api_key, user_id, _, automated_mode, is_4k = load_env_config()
-        
-        # If in automated mode, bypass menu and start syncing
-        if url and api_key and automated_mode:
+        # Read the configured values without requiring Overseerr to be reachable.
+        # load_env_config() normally returns None when its connection test fails,
+        # which previously made a slow-starting Overseerr look like "no config"
+        # and dropped the container into the interactive setup prompt.
+        url, api_key, user_id, _, automated_mode, is_4k = load_env_config(test_connection=False)
+
+        # If automated mode is configured, never fall through to the interactive
+        # menu/prompt (there is no TTY in the container, so that just hangs).
+        if automated_mode:
+            if not (url and api_key):
+                logging.error(
+                    "Automated mode is enabled but Overseerr URL/API key are missing. "
+                    "Waiting for configuration instead of prompting."
+                )
+                while not (url and api_key):
+                    time.sleep(30)
+                    url, api_key, user_id, _, automated_mode, is_4k = load_env_config(
+                        test_connection=False
+                    )
+
             logging.info("Starting in automated mode")
             overseerr_client = OverseerrClient(url, api_key, user_id)
+
+            # Wait for Overseerr instead of falling back to the interactive menu.
+            # Seerr starts at the same time as list-sync, so the first few probes
+            # after a node reboot legitimately fail with ECONNREFUSED.
+            retry_delay = 5
+            while True:
+                try:
+                    overseerr_client.test_connection()
+                    break
+                except Exception as e:
+                    logging.error(
+                        f"Overseerr is not reachable yet ({e}); retrying in {retry_delay}s"
+                    )
+                    time.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 60)
+
             try:
-                # Test connection to make sure credentials are valid
-                overseerr_client.test_connection()
                 # Try to load lists from environment if none exist
                 load_env_lists()
-                
+
                 # Always use the database sync interval (which was initialized from env if needed)
                 if sync_interval > 0:
                     logging.info(f"Starting automated sync with {sync_interval} hour interval (from database)")
@@ -1999,8 +2029,10 @@ def main():
                     sys.exit(0)
             except Exception as e:
                 logging.error(f"Error in automated mode: {str(e)}")
-                # Continue to interactive menu if automated mode fails
-        
+                # Do not drop into the interactive menu here: in a container it
+                # only blocks forever. Let the supervisor restart the process.
+                sys.exit(1)
+
         # Get API credentials if not in automated mode
         url, api_key, user_id = get_credentials()
         overseerr_client = OverseerrClient(url, api_key, user_id)

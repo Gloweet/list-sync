@@ -25,7 +25,8 @@ Trakt-free ID resolution, inspired by [AniPlanrr](https://github.com/noggl/AniPl
 | `list_sync/main.py` | New **Method 1.5**: IMDb id / title -> TMDB id via `id_resolver` (no Trakt). The Trakt methods (2 & 3) now only run when `TRAKT_CLIENT_ID` is set, avoiding retry/backoff storms. |
 | `listsync-nuxt/components/setup/Step2Configuration.vue`, `api_server.py` | Setup wizard step 2 no longer requires a Trakt Client ID. The field is optional and only format/API-validated when a value is entered. |
 | `.github/workflows/docker-build.yml` | Trimmed to a single `linux/amd64` push to `ghcr.io/<owner>/list-sync` (cluster is amd64). No attestation/SBOM/provenance, no external CI infra. |
-| `list_sync/providers/babelio.py` (new) | Scrapes the authenticated account's own library from babelio.com (`mabibliotheque.php`, paginated). babelio.com gates every page behind a WAF, so this logs in via SeleniumBase (undetected-chromedriver): opens `/connection.php`, dismisses the appconsent cookie banner, fills the `Login`/`Password` form, and drag-solves the slider captcha if it appears (flaky, so login retries up to 3x with page-state diagnostics). The resulting session cookies are cached to `data/babelio_session.json` so ongoing scraping uses plain `requests` without re-solving the captcha. |
+| `list_sync/providers/babelio.py` (new) | Scrapes the authenticated account's own library from babelio.com (`mabibliotheque.php`, paginated). babelio.com gates every page behind a WAF, so this logs in via SeleniumBase (undetected-chromedriver): opens `/connection.php`, dismisses the appconsent cookie banner, fills the `Login`/`Password` form, and drag-solves the slider captcha if it appears (flaky, so login retries up to 3x with page-state diagnostics). The login submit is scoped to `form[action*='connection.php']` and sent with `form.submit()` — the site uses `<button name="sub_btn">`, and a global `button[type=submit]` lookup silently clicked the header search button instead. The resulting session cookies are cached to `data/babelio_session.json` so ongoing scraping uses plain `requests` without re-solving the captcha. |
+| `list_sync/main.py` / `config.py` | Automated mode no longer treats a temporarily unreachable Overseerr as "no config". `load_env_config(test_connection=False)` is used at startup; automated mode waits for Seerr with exponential backoff and never falls into the interactive prompt (there is no TTY in the container). |
 | `list_sync/api/shelfmark.py` (new) | Client for [Shelfmark](https://github.com/calibrain/shelfmark) (self-hosted book search & request tool) - the book equivalent of Overseerr. Search metadata providers, list releases, queue a download. Tolerates a bare host (defaults to `http://host:8084`) and distinguishes "no releases" (empty list) from "release search failed" (Shelfmark answers 503 with a cause - e.g. the download source is behind an unsolvable protection challenge). Release searches can take up to Shelfmark's 300s budget (`SHELFMARK_RELEASE_TIMEOUT`, default 310s). |
 | `list_sync/main.py` | New `media_type == "book"` path: `sync_media_to_overseerr` now splits book items out and routes them through `sync_books_to_shelfmark`/`process_book_item` instead (Shelfmark has no library-status concept, so books are just matched + queued, no available/requested check). |
 | `list_sync/database.py` | `synced_items` gained `author`/`external_id` columns and a `should_sync_book()` skip-window check, since books have no TMDB/IMDb/Overseerr id to key on. |
@@ -38,7 +39,11 @@ library to Shelfmark. See `.env.example`. The Babelio login flow is more
 fragile than the other providers (it depends on solving a custom slider
 captcha) - check `data/list_sync.log` if it stops working.
 
-Two cluster-side requirements discovered while testing (both committed to
+Cluster-side `apps/base/arr/list-sync/deployment.yaml` also has a
+`wait-for-seerr` init container: Seerr and list-sync start together after a
+reboot, and the 2026-10-30 race left list-sync stuck at the credential prompt.
+
+Two Shelfmark-side requirements discovered while testing (both committed to
 `Gloweet/gitops-demo`, `apps/base/arr/shelfmark/`):
 - Shelfmark must run **≥ v1.4.0** — older releases (e.g. v1.3.15) reject
   `SHELFMARK_API_KEY` with 401 (the feature landed in v1.4.0).

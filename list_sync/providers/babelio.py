@@ -129,14 +129,23 @@ def _solve_slider_captcha(sb, timeout: int = 12) -> bool:
 
         track = sb.driver.find_element(By.ID, "slider-track")
         thumb = sb.driver.find_element(By.ID, "slider-thumb")
-        distance = int(track.get_attribute("data-drag-distance") or "231")
+        advertised = int(track.get_attribute("data-drag-distance") or "231")
+        # Drag far enough for the thumb's right edge to actually reach the
+        # track's right edge. data-drag-distance is usually 2-4px shorter
+        # than the geometric distance (it sizes the fill bar, not the thumb),
+        # and stopping short leaves the challenge unsolved.
+        try:
+            geometric = int(track.rect["width"] - thumb.rect["width"] + 2)
+        except Exception:  # noqa: BLE001
+            geometric = advertised
+        distance = max(advertised, geometric)
 
         actions = ActionChains(sb.driver)
         actions.move_to_element(thumb)
         actions.click_and_hold()
         actions.pause(0.15)
 
-        steps = random.randint(12, 18)
+        steps = random.randint(18, 26)
         step_size = distance / steps
         for _ in range(steps):
             jitter_y = random.randint(-2, 2)
@@ -168,47 +177,94 @@ def _dismiss_consent_if_present(sb) -> None:
         if not frames:
             return
         sb.switch_to_frame('iframe[title="Consent window"]')
-        for text in ("Continue without accepting", "Accept all"):
+        for text in (
+            "Continue without accepting",
+            "Continuer sans accepter",
+            "Accept all",
+            "Tout accepter",
+        ):
             buttons = sb.find_elements("tag name", "button")
             for button in buttons:
                 if text.lower() in (button.text or "").lower():
                     button.click()
-                    sb.switch_to_default_content()
+                    try:
+                        sb.switch_to_default_content()
+                    except Exception:  # noqa: BLE001
+                        pass
                     sb.sleep(1)
+                    # Give the consent script a moment to remove its overlay;
+                    # otherwise the next click can be intercepted by the iframe.
+                    try:
+                        sb.wait_for_element_not_present('iframe[title="Consent window"]', timeout=5)
+                    except Exception:  # noqa: BLE001
+                        pass
                     return
-        sb.switch_to_default_content()
+        try:
+            sb.switch_to_default_content()
+        except Exception:  # noqa: BLE001
+            pass
     except Exception as exc:  # noqa: BLE001 - consent is best-effort
         logging.debug(f"Babelio: could not dismiss consent banner ({exc})")
+        try:
+            sb.switch_to_default_content()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _find_login_form(sb):
+    """Return Babelio's login <form>, if present."""
+    for selector in ("form[action*='connection.php']", "form[action*='connexion.php']"):
+        forms = sb.find_elements(selector)
+        if forms:
+            return forms[0]
+    return None
 
 
 def _fill_login_form(sb, email: str, password: str) -> bool:
     """
     Fill and submit Babelio's login form (/connection.php).
 
-    The form fields are name="Login" and name="Password" (verified against
-    the live site). We try those exact names first, then fall back to
-    generic matching by input type in case Babelio changes the markup.
+    The form fields are name="Login" and name="Password". The submit control
+    is a <button name="sub_btn">Se connecter</button>; it is *not* an
+    <input name="sub_btn">. Searching globally for button[type=submit] picks
+    the header's search button instead and silently never logs in, so every
+    lookup here is scoped to the login form. Submission goes through the
+    form element (JS) rather than the button, which also avoids the fading
+    cookie-banner iframe intercepting the click.
     """
-    email_field = None
-    for selector in (
-        "input[name='Login']",
-        "input[type='email']",
-        "input[name*='mail' i]",
-        "input[name*='login' i]",
-        "input[type='text']",
-    ):
-        elements = sb.find_elements(selector)
-        if elements:
-            email_field = elements[0]
-            break
+    from selenium.webdriver.common.by import By
 
-    password_field = None
-    for selector in ("input[name='Password']", "input[type='password']"):
-        elements = sb.find_elements(selector)
-        if elements:
-            password_field = elements[0]
-            break
+    form = _find_login_form(sb)
 
+    def find_fields():
+        def find(selector):
+            if form is not None:
+                return form.find_elements(By.CSS_SELECTOR, selector)
+            return sb.find_elements(selector)
+
+        email_field = None
+        for selector in (
+            "input[name='Login']",
+            "input[type='email']",
+            "input[name*='mail' i]",
+            "input[name*='login' i]",
+            "input[type='text']",
+        ):
+            elements = find(selector)
+            if elements:
+                email_field = elements[0]
+                break
+
+        password_field = None
+        for selector in ("input[name='Password']", "input[type='password']"):
+            elements = find(selector)
+            if elements:
+                password_field = elements[0]
+                break
+
+        return email_field, password_field
+
+    email_field, password_field = find_fields()
     if not email_field or not password_field:
         logging.error("Babelio: login form fields not found on the page")
         return False
@@ -218,13 +274,32 @@ def _fill_login_form(sb, email: str, password: str) -> bool:
     password_field.clear()
     password_field.send_keys(password)
 
-    for selector in ("input[name='sub_btn']", "button[type='submit']", "input[type='submit']"):
-        elements = sb.find_elements(selector)
-        if elements:
-            elements[0].click()
-            return True
+    try:
+        if form is not None:
+            # form.submit() is deliberately used instead of clicking the
+            # <button>: the click path sometimes navigates through
+            # /captcha.php and makes ChromeDriver block for its full 120s
+            # read timeout. The server accepts the POST without sub_btn.
+            logging.info("Babelio: submitting login form with form.submit()")
+            sb.driver.execute_script("arguments[0].submit();", form)
+        else:
+            submit = None
+            for selector in ("*[name='sub_btn']", "button[type='submit']", "input[type='submit']"):
+                elements = sb.find_elements(selector)
+                if elements:
+                    submit = elements[0]
+                    break
+            if submit is not None:
+                logging.info("Babelio: submitting login form by clicking the submit button")
+                sb.driver.execute_script("arguments[0].click();", submit)
+            else:
+                logging.info("Babelio: login form not found, using password field submit()")
+                password_field.submit()
+    except Exception as exc:  # noqa: BLE001
+        # A page-load timeout can still leave the auth cookies in place, so do
+        # not fail here - the caller checks for id_user and retries if needed.
+        logging.warning(f"Babelio: login submit raised an error ({exc})")
 
-    password_field.submit()
     return True
 
 
@@ -239,6 +314,12 @@ def _login_with_selenium(email: str, password: str) -> Optional[Dict[str, str]]:
     for attempt in range(1, 4):
         try:
             with SB(uc=True, headless=True) as sb:
+                # The WAF sometimes leaves a navigation hanging; bound it so one
+                # attempt cannot occupy the sync for ChromeDriver's 120s default.
+                try:
+                    sb.driver.set_page_load_timeout(45)
+                except Exception:  # noqa: BLE001
+                    pass
                 try:
                     sb.uc_open_with_reconnect(f"{BASE_URL}/connection.php", 4)
                 except Exception:
@@ -259,18 +340,31 @@ def _login_with_selenium(email: str, password: str) -> Optional[Dict[str, str]]:
                 _solve_slider_captcha(sb)
                 _dismiss_consent_if_present(sb)
 
+                # The login form is injected after the challenge is accepted;
+                # give it a moment instead of declaring "form missing" too early.
+                for _ in range(20):
+                    if sb.find_elements("input[name='Login']") or sb.find_elements("input[type='password']"):
+                        break
+                    sb.sleep(0.5)
+
                 if not _fill_login_form(sb, email, password):
                     logging.warning(f"Babelio: login form not found (attempt {attempt})")
                     _log_page_state(sb, "form-missing")
                     continue
 
-                sb.sleep(3)
-                # A slider challenge can appear right after submitting the form.
-                _solve_slider_captcha(sb)
-                sb.sleep(1)
+                # Wait for the POST /connection.php?r=1 response and the id_user
+                # cookie it sets. A fixed 3s sleep was both too short on slow
+                # responses and longer than needed on fast ones.
+                cookies = {}
+                for _ in range(20):
+                    sb.sleep(0.5)
+                    cookies = {c["name"]: c["value"] for c in sb.driver.get_cookies()}
+                    if "id_user" in cookies:
+                        break
 
-                cookies = {c["name"]: c["value"] for c in sb.driver.get_cookies()}
                 if "id_user" not in cookies:
+                    # A slider challenge can appear right after submitting the form.
+                    _solve_slider_captcha(sb)
                     logging.warning(
                         f"Babelio: login did not produce an authenticated session "
                         f"(no id_user cookie) - attempt {attempt} - check BABELIO_EMAIL/BABELIO_PASSWORD"
@@ -313,6 +407,18 @@ def _get_authenticated_session(email: str, password: str) -> requests.Session:
         except Exception as exc:  # noqa: BLE001
             logging.debug(f"Babelio: cached session check failed ({exc})")
         logging.info("Babelio: cached session is stale or invalid, logging in again")
+
+    # Cheap preflight before launching Chrome. When the WAF has rate-limited
+    # this egress IP, TCP connects can hang until the browser/ChromeDriver
+    # timeout (minutes); a 20s requests probe turns that into a fast, clear
+    # "Babelio unreachable" error so the rest of the sync can continue.
+    try:
+        probe = requests.get(f"{BASE_URL}/connection.php", headers=_REQUEST_HEADERS, timeout=20)
+        logging.debug(f"Babelio: preflight answered HTTP {probe.status_code}")
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"Babelio is unreachable from this egress IP ({exc}); skipping Selenium login"
+        ) from exc
 
     cookies = _login_with_selenium(email, password)
     if not cookies:
