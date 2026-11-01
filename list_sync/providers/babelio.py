@@ -54,6 +54,25 @@ _REQUEST_HEADERS = {
     "Accept-Language": "fr,fr-FR;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
+
+def _get_proxy() -> Optional[str]:
+    """Optional egress proxy for Babelio only (e.g. a gluetun HTTP proxy).
+
+    Set BABELIO_PROXY=http://host:port (or socks5://...) to route all Babelio
+    traffic - plain requests and the Selenium login - through a clean IP
+    without moving the rest of list-sync. Unset means direct.
+    """
+    proxy = (os.getenv("BABELIO_PROXY") or "").strip()
+    return proxy or None
+
+
+def _requests_proxies() -> Optional[Dict[str, str]]:
+    proxy = _get_proxy()
+    if not proxy:
+        return None
+    return {"http": proxy, "https": proxy}
+
+
 # Row extraction regexes, matched against the raw HTML of one mabibliotheque.php page.
 _ROW_SPLIT_RE = re.compile(r'<tr><td class="check">')
 _TITLE_RE = re.compile(r'<td class="titre_livre"><a href="([^"]+)"[^>]*><h2>(.*?)</h2></a>', re.DOTALL)
@@ -93,6 +112,9 @@ def _save_cookies(cookies: Dict[str, str]) -> None:
 def _build_session(cookies: Dict[str, str]) -> requests.Session:
     session = requests.Session()
     session.headers.update(_REQUEST_HEADERS)
+    proxies = _requests_proxies()
+    if proxies:
+        session.proxies.update(proxies)
     for name, value in cookies.items():
         session.cookies.set(name, value, domain="www.babelio.com")
     return session
@@ -310,10 +332,16 @@ def _login_with_selenium(email: str, password: str) -> Optional[Dict[str, str]]:
     # The WAF challenge is flaky - the first page load is sometimes the
     # "drag to verify" captcha, sometimes the login form, sometimes a retry
     # of the whole flow is needed. Retry a few times before giving up.
+    proxy = _get_proxy()
+    if proxy:
+        logging.info(f"Babelio: routing Selenium login through proxy {proxy}")
     last_error = None
     for attempt in range(1, 4):
         try:
-            with SB(uc=True, headless=True) as sb:
+            sb_kwargs = {"uc": True, "headless": True}
+            if proxy:
+                sb_kwargs["proxy"] = proxy
+            with SB(**sb_kwargs) as sb:
                 # The WAF sometimes leaves a navigation hanging; bound it so one
                 # attempt cannot occupy the sync for ChromeDriver's 120s default.
                 try:
@@ -413,7 +441,12 @@ def _get_authenticated_session(email: str, password: str) -> requests.Session:
     # timeout (minutes); a 20s requests probe turns that into a fast, clear
     # "Babelio unreachable" error so the rest of the sync can continue.
     try:
-        probe = requests.get(f"{BASE_URL}/connection.php", headers=_REQUEST_HEADERS, timeout=20)
+        probe = requests.get(
+            f"{BASE_URL}/connection.php",
+            headers=_REQUEST_HEADERS,
+            timeout=20,
+            proxies=_requests_proxies(),
+        )
         logging.debug(f"Babelio: preflight answered HTTP {probe.status_code}")
     except requests.RequestException as exc:
         raise RuntimeError(
