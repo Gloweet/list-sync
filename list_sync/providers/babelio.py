@@ -133,13 +133,24 @@ def _is_authenticated_page(html_text: str) -> bool:
 # Selenium login (only used when the cached session is missing/stale)
 # ---------------------------------------------------------------------------
 
+
+
+def _ease_out_quad(t: float) -> float:
+    """Quadratic ease-out: slows down as it approaches the target."""
+    return 1 - (1 - t) ** 2
 def _solve_slider_captcha(sb, timeout: int = 12) -> bool:
     """
     Solve Babelio's "glisser pour vérifier" drag-slider WAF challenge, if
     present on the current page. Returns True if no challenge was present,
     or if it was solved successfully.
+
+    A human-like drag trajectory (ease-out quad, jitter, pauses) is used.
+    After the drag, we wait for the slider to disappear; if it persists
+    (we land on /captcha.php), the attempt is marked as failed so the
+    outer retry loop can reload the page and try again.
     """
     from selenium.webdriver.common.by import By
+    from selenium.webdriver.common.action_chains import ActionChains
 
     try:
         sb.wait_for_element_present("#slider-track", timeout=timeout)
@@ -147,46 +158,77 @@ def _solve_slider_captcha(sb, timeout: int = 12) -> bool:
         return True  # No challenge on this page.
 
     try:
-        from selenium.webdriver.common.action_chains import ActionChains
-
         track = sb.driver.find_element(By.ID, "slider-track")
         thumb = sb.driver.find_element(By.ID, "slider-thumb")
         advertised = int(track.get_attribute("data-drag-distance") or "231")
-        # Drag far enough for the thumb's right edge to actually reach the
-        # track's right edge. data-drag-distance is usually 2-4px shorter
-        # than the geometric distance (it sizes the fill bar, not the thumb),
-        # and stopping short leaves the challenge unsolved.
         try:
             geometric = int(track.rect["width"] - thumb.rect["width"] + 2)
         except Exception:  # noqa: BLE001
             geometric = advertised
         distance = max(advertised, geometric)
 
+        # Simulate a user reading the challenge before starting to drag.
+        sb.sleep(random.uniform(0.5, 1.2))
+
         actions = ActionChains(sb.driver)
         actions.move_to_element(thumb)
         actions.click_and_hold()
-        actions.pause(0.15)
+        actions.pause(random.uniform(0.1, 0.25))
 
-        steps = random.randint(18, 26)
-        step_size = distance / steps
-        for _ in range(steps):
-            jitter_y = random.randint(-2, 2)
-            actions.move_by_offset(step_size, jitter_y)
-            actions.pause(random.uniform(0.02, 0.06))
-        actions.pause(0.2)
+        steps = random.randint(24, 32)
+        # ease-out quad: fast at start, slow at the end
+        positions = [_ease_out_quad(i / steps) * distance for i in range(steps + 1)]
+        deltas = [positions[i + 1] - positions[i] for i in range(steps)]
+        # Keep only non-zero deltas
+        deltas = [d for d in deltas if d != 0]
+        # Drop some early deltas to simulate hesitation, then renormalize
+        keep = []
+        for d in deltas:
+            if random.random() < 0.2 and len(keep) < 3:
+                continue
+            keep.append(d)
+        # renormalize total distance to `distance`
+        factor = distance / sum(keep) if sum(keep) > 0 else 1.0
+        keep = [int(d * factor) for d in keep]
+        # ensure at least one step has movement
+        if not keep:
+            keep = [distance // steps] * steps
+
+        actions.move_to_element(thumb)
+        actions.click_and_hold()
+        actions.pause(random.uniform(0.1, 0.2))
+
+        for i, dx in enumerate(keep):
+            jitter_y = random.randint(-3, 3)
+            # progressive pause: slower near the end
+            pause = random.uniform(0.03, 0.08) * (1 + i / len(keep))
+            actions.move_by_offset(dx, jitter_y).pause(pause)
+
+        actions.pause(random.uniform(0.3, 0.6))
         actions.release()
         actions.perform()
-        sb.sleep(1.5)
+        sb.sleep(2)
     except Exception as exc:  # noqa: BLE001
         logging.warning(f"Babelio: slider captcha drag attempt failed: {exc}")
         return False
 
-    try:
-        sb.wait_for_element_not_present("#slider-track", timeout=8)
-        return True
-    except Exception:
-        return False
+    # Check whether the slider disappeared or if we landed on the challenge page.
+    url = sb.get_current_url()
+    title = sb.get_title()
+    slider_gone = len(sb.find_elements("#slider-track")) == 0
+    is_captcha = "captcha.php" in url or "Vérification de sécurité" in title
 
+    if slider_gone and not is_captcha:
+        # Success: slider removed and we're on the login page.
+        return True
+    else:
+        # Failure: either the slider is still there, or we're on /captcha.php.
+        # Log for diagnostics and return False so the outer retry loop can
+        # reload the page and try again.
+        logging.debug(
+            f"slider_gone={slider_gone} url={url[:120]} title={title[:80]}"
+        )
+        return False
 
 def _dismiss_consent_if_present(sb) -> None:
     """
@@ -332,16 +374,10 @@ def _login_with_selenium(email: str, password: str) -> Optional[Dict[str, str]]:
     # The WAF challenge is flaky - the first page load is sometimes the
     # "drag to verify" captcha, sometimes the login form, sometimes a retry
     # of the whole flow is needed. Retry a few times before giving up.
-    proxy = _get_proxy()
-    if proxy:
-        logging.info(f"Babelio: routing Selenium login through proxy {proxy}")
     last_error = None
     for attempt in range(1, 4):
         try:
-            sb_kwargs = {"uc": True, "headless": True}
-            if proxy:
-                sb_kwargs["proxy"] = proxy
-            with SB(**sb_kwargs) as sb:
+            with SB(uc=True, headless=True) as sb:
                 # The WAF sometimes leaves a navigation hanging; bound it so one
                 # attempt cannot occupy the sync for ChromeDriver's 120s default.
                 try:
@@ -356,12 +392,21 @@ def _login_with_selenium(email: str, password: str) -> Optional[Dict[str, str]]:
 
                 solved = _solve_slider_captcha(sb)
                 if not solved:
-                    sb.sleep(1)
-                    solved = _solve_slider_captcha(sb)
-                if not solved:
-                    logging.warning(f"Babelio: slider captcha not solved (attempt {attempt})")
-                    _log_page_state(sb, "after-slider-fail")
-                    continue
+                    # If we landed on /captcha.php, try reloading connection.php
+                    # within the same session to get a fresh challenge without
+                    # relaunching the whole browser.
+                    if sb.get_current_url().endswith("/captcha.php") or "Vérification de sécurité" in sb.get_title():
+                        try:
+                            sb.open(f"{BASE_URL}/connection.php")
+                            sb.sleep(1)
+                            solved = _solve_slider_captcha(sb)
+                        except Exception as exc:
+                            logging.warning(f"Babelio: reload + slider exc: {exc}")
+                    if not solved:
+                        sb.sleep(1)
+                        logging.warning(f"Babelio: slider captcha not solved (attempt {attempt})")
+                        _log_page_state(sb, "after-slider-fail")
+                        continue
 
                 sb.sleep(1)
                 # The slider can reappear after the first solve - clear it again.
@@ -408,7 +453,6 @@ def _login_with_selenium(email: str, password: str) -> Optional[Dict[str, str]]:
 
     logging.error(f"Babelio: Selenium login failed after 3 attempts ({last_error})")
     return None
-
 
 def _log_page_state(sb, label: str) -> None:
     """Log what is actually on the page, for debugging the flaky WAF/login."""
