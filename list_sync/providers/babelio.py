@@ -74,10 +74,18 @@ def _requests_proxies() -> Optional[Dict[str, str]]:
 
 
 # Row extraction regexes, matched against the raw HTML of one mabibliotheque.php page.
-_ROW_SPLIT_RE = re.compile(r'<tr><td class="check">')
-_TITLE_RE = re.compile(r'<td class="titre_livre"><a href="([^"]+)"[^>]*><h2>(.*?)</h2></a>', re.DOTALL)
-_YEAR_RE = re.compile(r'</h2></a><p[^>]*>(\d{4})</p>')
-_AUTHOR_RE = re.compile(r'<td class="auteur"><a[^>]*>(.*?)</a></td>', re.DOTALL)
+# Babelio migrated to a new v3 layout where each book is a <li class="lib-book">
+# inside <ul class="lib-books">:
+#   <li class="lib-book" id="b123456789">
+#     <a href="/livres/Author-Title/12345" class="lib-book-cover">...</a>
+#     <div class="lib-book-main">
+#       <h3 class="lib-book-title"><a href="/livres/Author-Title/12345">Title</a></h3>
+#       <p class="lib-book-author"><a href="/auteur/Author/999">Author Name</a><span class="lib-book-year">2007</span></p>
+#       ...
+_ROW_SPLIT_RE = re.compile(r'<li class="lib-book"[^>]*>')
+_TITLE_RE = re.compile(r'<h3 class="lib-book-title"><a[^>]*>(.*?)</a></h3>', re.DOTALL)
+_YEAR_RE = re.compile(r'<span class="lib-book-year">(\d{4})</span>')
+_AUTHOR_RE = re.compile(r'<a[^>]*href="/auteur/[^"]*"[^>]*>(.*?)</a>', re.DOTALL)
 _EDITOR_RE = re.compile(r'<span class="titre_livre_editor">(.*?)</span>', re.DOTALL)
 _BABELIO_BOOK_ID_RE = re.compile(r'/livres/[^/"]+/(\d+)')
 
@@ -527,12 +535,15 @@ def _parse_book_rows(html_text: str) -> List[Dict[str, Any]]:
         title_match = _TITLE_RE.search(row)
         if not title_match:
             continue
-        href, raw_title = title_match.groups()
+        raw_title = title_match.group(1)
         title = _strip_tags(raw_title)
         if not title:
             continue
 
-        book_id_match = _BABELIO_BOOK_ID_RE.search(href)
+        # Extract book id from the link inside the title h3
+        link_match = re.search(r'<h3 class="lib-book-title"><a href="([^"]+)"', row)
+        href = link_match.group(1) if link_match else None
+        book_id_match = _BABELIO_BOOK_ID_RE.search(href) if href else None
         babelio_id = book_id_match.group(1) if book_id_match else None
 
         year_match = _YEAR_RE.search(row)
