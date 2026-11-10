@@ -13,11 +13,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Any, Optional, Tuple
 
+from .api.komga import KomgaClient
 from .api.overseerr import OverseerrClient
 from .api.shelfmark import ShelfmarkClient
 from .config import (
     load_config, load_env_config, load_env_lists, save_config,
-    CONFIG_FILE, get_trakt_client_id, get_shelfmark_config
+    CONFIG_FILE, get_trakt_client_id, get_shelfmark_config, get_komga_config
 )
 from .database import (
     init_database, load_list_ids, save_list_id, delete_list,
@@ -929,11 +930,43 @@ def process_book_item(item: Dict[str, Any], shelfmark_client: ShelfmarkClient, d
         return result
 
 
+def _get_collection_tags(synced_lists: List[Dict[str, str]]) -> List[str]:
+    """
+    Generate collection tags from synced lists configuration.
+    
+    Args:
+        synced_lists: List of synced list info dicts with 'type' and 'id' keys
+        
+    Returns:
+        List of unique tag names
+    """
+    tags = set()
+    for sl in synced_lists or []:
+        list_type = sl.get('type', '')
+        list_id = sl.get('id', '')
+        if list_type == 'babelio':
+            tags.add('Librairie de PheonBest')
+        elif list_type == 'anilist':
+            tags.add('AniList')
+        elif list_type == 'letterboxd':
+            tags.add('Letterboxd')
+        elif list_type == 'trakt':
+            tags.add('Trakt')
+        elif list_type == 'mdblist':
+            tags.add('MDBList')
+        elif list_type == 'stevenlu':
+            tags.add('Steven Lu')
+        else:
+            tags.add(list_type.capitalize())
+    return list(tags)
+
+
 def sync_books_to_shelfmark(
     book_items: List[Dict[str, Any]],
     shelfmark_client: Optional[ShelfmarkClient],
     sync_results: SyncResults,
     dry_run: bool = False,
+    synced_lists: List[Dict[str, str]] = None,
 ) -> None:
     """
     Sync book items to Shelfmark, mutating `sync_results` in place so the
@@ -946,9 +979,18 @@ def sync_books_to_shelfmark(
             None if SHELFMARK_URL/SHELFMARK_API_KEY aren't configured
         sync_results (SyncResults): Sync results to update in place
         dry_run (bool): Whether to perform a dry run
+        synced_lists (List[Dict[str, str]], optional): List of synced list info
+            for tagging purposes
     """
     if not book_items:
         return
+
+    # Get Komga client if configured
+    komga_url, komga_api_key = get_komga_config()
+    komga_client = KomgaClient(komga_url, komga_api_key) if (komga_url and komga_api_key) else None
+
+    # Build collection tags from synced lists
+    collection_tags = _get_collection_tags(synced_lists or [])
 
     if shelfmark_client is None:
         logging.warning(
@@ -971,6 +1013,32 @@ def sync_books_to_shelfmark(
             logging.warning(f"⚠️ Cancellation detected during book processing at item {i}/{len(book_items)}")
             break
 
+        title = item.get('title', 'Unknown')
+        author = item.get('author')
+
+        # Check Komga first - if book already in library, skip download
+        komga_book_id = None
+        if komga_client:
+            try:
+                komga_match = komga_client.find_book_by_title_author(title, author)
+                if komga_match:
+                    komga_book_id = komga_match.get('id')
+                    # Tag with collection tags if missing
+                    if collection_tags:
+                        existing_tags = [t.get('name') for t in komga_match.get('tags', []) or []]
+                        for tag_name in collection_tags:
+                            if tag_name not in existing_tags:
+                                tag_id = komga_client.find_or_create_tag(tag_name)
+                                if tag_id:
+                                    komga_client.add_tag_to_book(komga_book_id, tag_id)
+
+                    sync_results.results["already_available"] = sync_results.results.get("already_available", 0) + 1
+                    sync_results.media_type_counts["book"] = sync_results.media_type_counts.get("book", 0) + 1
+                    print(f"☑️ {title}: Already in Komga ({i}/{len(book_items)})")
+                    continue
+            except Exception as e:
+                logging.warning(f"Komga check failed for '{title}': {e}")
+
         try:
             result = process_book_item(item, shelfmark_client, dry_run)
             status = result["status"]
@@ -985,6 +1053,9 @@ def sync_books_to_shelfmark(
         title = item.get('title', 'Unknown')
         if status == "requested":
             print(f"✅ {title}: Successfully Requested ({i}/{len(book_items)})")
+            # Note: We cannot tag in Komga immediately since the book will be
+            # downloaded by Shelfmark/qBittorrent and added to Komga on next scan.
+            # On next sync, the book will be found in Komga and tagged then.
         elif status == "skipped":
             print(f"⏭️  {title}: Skipped ({i}/{len(book_items)})")
         elif status == "not_found":
@@ -1033,7 +1104,7 @@ def sync_media_to_overseerr(
         media_items = [item for item in media_items if item.get('media_type') != 'book']
         shelfmark_url, shelfmark_api_key = get_shelfmark_config()
         shelfmark_client = ShelfmarkClient(shelfmark_url, shelfmark_api_key) if (shelfmark_url and shelfmark_api_key) else None
-        sync_books_to_shelfmark(book_items, shelfmark_client, sync_results, dry_run=dry_run)
+        sync_books_to_shelfmark(book_items, shelfmark_client, sync_results, dry_run=dry_run, synced_lists=synced_lists)
 
     print(f"\n🎬  Processing {len(media_items)} media items...")
     

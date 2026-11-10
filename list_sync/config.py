@@ -255,6 +255,28 @@ def get_shelfmark_config() -> Tuple[Optional[str], Optional[str]]:
     return url, api_key
 
 
+def get_komga_config() -> Tuple[Optional[str], Optional[str]]:
+    """
+    Get Komga (https://komga.org/) URL and API key from environment variables.
+    Komga is used as the library manager for downloaded books.
+    
+    Returns:
+        Tuple[Optional[str], Optional[str]]: Base URL and API key, or (None, None) if unset
+    """
+    if os.path.exists('.env'):
+        load_dotenv()
+    
+    url = os.getenv('KOMGA_URL')
+    api_key = os.getenv('KOMGA_API_KEY')
+    import logging
+    if url and api_key:
+        logging.info("Komga configuration loaded from environment")
+    else:
+        logging.warning("KOMGA_URL/KOMGA_API_KEY not set - Komga features will be disabled")
+    
+    return url, api_key
+
+
 def load_env_config(test_connection: bool = True) -> Tuple[Optional[str], Optional[str], Optional[str], float, bool, bool]:
     """
     Load configuration from database or environment variables (database preferred).
