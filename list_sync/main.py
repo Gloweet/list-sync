@@ -13,12 +13,14 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Any, Optional, Tuple
 
+from .api.audiobookshelf import AudiobookshelfClient
 from .api.komga import KomgaClient
 from .api.overseerr import OverseerrClient
 from .api.shelfmark import ShelfmarkClient
 from .config import (
     load_config, load_env_config, load_env_lists, save_config,
-    CONFIG_FILE, get_trakt_client_id, get_shelfmark_config, get_komga_config
+    CONFIG_FILE, get_trakt_client_id, get_shelfmark_config, get_komga_config,
+    get_audiobookshelf_config
 )
 from .database import (
     init_database, load_list_ids, save_list_id, delete_list,
@@ -800,24 +802,33 @@ def _pick_best_book(matches: List[Dict[str, Any]], author: Optional[str]) -> Dic
     return matches[0]
 
 
-def process_book_item(item: Dict[str, Any], shelfmark_client: ShelfmarkClient, dry_run: bool) -> Dict[str, Any]:
+def process_book_item(
+    item: Dict[str, Any],
+    shelfmark_client: ShelfmarkClient,
+    dry_run: bool,
+    want_ebook: bool = True,
+    want_audiobook: bool = False,
+) -> Dict[str, Any]:
     """
     Process a single book item for sync to Shelfmark.
 
     Workflow:
     1. Search Shelfmark's configured metadata providers for the book (title + author)
-    2. List releases for the best-matching result
-    3. Queue the first available release for download
+    2. For each wanted format (ebook / audiobook), list releases
+    3. Queue the first available release for each format
 
     Unlike movies/TV there is no "already available" / "already requested"
     check against a library: Shelfmark is a search & download tool, not a
     library manager (see its README "Project Scope" section). A book is
-    either matched and queued, or it isn't.
+    either matched and queued, or it isn't. Callers decide which formats are
+    still missing (Komga for ebooks, Audiobookshelf for audiobooks).
 
     Args:
         item (Dict[str, Any]): Book item (title, author, year, ...) from the Babelio provider
         shelfmark_client (ShelfmarkClient): Shelfmark API client
         dry_run (bool): Whether to perform a dry run
+        want_ebook (bool): Whether to request an ebook release
+        want_audiobook (bool): Whether to request an audiobook release
 
     Returns:
         Dict[str, Any]: Processing result
@@ -897,28 +908,54 @@ def process_book_item(item: Dict[str, Any], shelfmark_client: ShelfmarkClient, d
             result["status"] = "skipped"
             return result
 
-        releases = shelfmark_client.get_releases(provider, provider_id, content_type="ebook")
-        if releases is None:
-            logging.warning(f"⚠️  Shelfmark: release search failed for '{title}' ({external_id}) - not an availability answer")
-            _save("error", external_id=external_id)
-            result["status"] = "error"
-            result["error_message"] = f"Shelfmark release search failed for '{title}'"
-            return result
-        if not releases:
-            logging.warning(f"⚠️  Shelfmark: no releases found for '{title}' ({external_id})")
-            _save("not_found", external_id=external_id)
-            result["status"] = "not_found"
+        content_types = []
+        if want_ebook:
+            content_types.append("ebook")
+        if want_audiobook:
+            content_types.append("audiobook")
+        if not content_types:
+            result["status"] = "already_available"
             return result
 
-        release = releases[0]
+        format_statuses: Dict[str, str] = {}
+        for content_type in content_types:
+            releases = shelfmark_client.get_releases(provider, provider_id, content_type=content_type)
+            if releases is None:
+                logging.warning(
+                    f"⚠️  Shelfmark: {content_type} release search failed for '{title}' "
+                    f"({external_id}) - not an availability answer"
+                )
+                format_statuses[content_type] = "error"
+                continue
+            if not releases:
+                logging.warning(f"⚠️  Shelfmark: no {content_type} releases found for '{title}' ({external_id})")
+                format_statuses[content_type] = "not_found"
+                continue
 
-        queued = shelfmark_client.download_release(release)
-        status = "requested" if queued else "request_failed"
-        logging.info(f"{'✅ SUCCESS' if queued else '❌ ERROR'}: Shelfmark download {'queued' if queued else 'failed'} for '{title}'")
+            queued = shelfmark_client.download_release(releases[0])
+            format_statuses[content_type] = "requested" if queued else "request_failed"
+            logging.info(
+                f"{'✅ SUCCESS' if queued else '❌ ERROR'}: Shelfmark {content_type} download "
+                f"{'queued' if queued else 'failed'} for '{title}'"
+            )
+
+        statuses = list(format_statuses.values())
+        if "requested" in statuses:
+            status = "requested"
+        elif "error" in statuses:
+            status = "error"
+        elif "not_found" in statuses:
+            status = "not_found"
+        else:
+            status = "request_failed"
+
+        result["formats"] = format_statuses
+        if status == "error":
+            failed = ", ".join(ct for ct, s in format_statuses.items() if s == "error")
+            result["error_message"] = f"Shelfmark release search failed for {failed} '{title}'"
         _save(status, external_id=external_id)
         result["status"] = status
         return result
-
     except Exception as e:
         logging.error(f"❌ ERROR: Exception during book processing: {str(e)}")
         result["status"] = "error"
@@ -985,9 +1022,17 @@ def sync_books_to_shelfmark(
     if not book_items:
         return
 
-    # Get Komga client if configured
+    # Get Komga client if configured (ebook availability)
     komga_url, komga_api_key = get_komga_config()
     komga_client = KomgaClient(komga_url, komga_api_key) if (komga_url and komga_api_key) else None
+
+    # Get Audiobookshelf client if configured (audiobook availability)
+    audiobookshelf_url, audiobookshelf_api_key = get_audiobookshelf_config()
+    audiobookshelf_client = (
+        AudiobookshelfClient(audiobookshelf_url, audiobookshelf_api_key)
+        if (audiobookshelf_url and audiobookshelf_api_key)
+        else None
+    )
 
     # Build collection tags from synced lists
     collection_tags = _get_collection_tags(synced_lists or [])
@@ -1016,31 +1061,72 @@ def sync_books_to_shelfmark(
         title = item.get('title', 'Unknown')
         author = item.get('author')
 
-        # Check Komga first - if book already in library, skip download
-        komga_book_id = None
+        # Check both libraries first: Komga holds the ebook, Audiobookshelf
+        # the audiobook. Request only the formats that are missing.
+        komga_match = None
         if komga_client:
             try:
                 komga_match = komga_client.find_book_by_title_author(title, author)
                 if komga_match:
-                    komga_book_id = komga_match.get('id')
-                    # Tag with collection tags if missing
                     if collection_tags:
                         existing_tags = [t.get('name') for t in komga_match.get('tags', []) or []]
                         for tag_name in collection_tags:
                             if tag_name not in existing_tags:
                                 tag_id = komga_client.find_or_create_tag(tag_name)
                                 if tag_id:
-                                    komga_client.add_tag_to_book(komga_book_id, tag_id)
-
-                    sync_results.results["already_available"] = sync_results.results.get("already_available", 0) + 1
-                    sync_results.media_type_counts["book"] = sync_results.media_type_counts.get("book", 0) + 1
-                    print(f"☑️ {title}: Already in Komga ({i}/{len(book_items)})")
-                    continue
+                                    komga_client.add_tag_to_book(komga_match.get('id'), tag_id)
             except Exception as e:
                 logging.warning(f"Komga check failed for '{title}': {e}")
 
+        audiobookshelf_match = None
+        audiobookshelf_checked = audiobookshelf_client is not None
+        if audiobookshelf_client:
+            try:
+                audiobookshelf_match = audiobookshelf_client.find_book_by_title_author(title, author)
+            except Exception as e:
+                audiobookshelf_checked = False
+                logging.warning(f"Audiobookshelf check failed for '{title}': {e}")
+
+        want_ebook = not bool(komga_match)
+        want_audiobook = audiobookshelf_checked and not bool(audiobookshelf_match)
+
+        if not want_ebook and not want_audiobook:
+            if audiobookshelf_client is not None and not audiobookshelf_checked:
+                # Ebook in Komga, audiobook presence unknown: don't request blindly.
+                sync_results.results["error"] = sync_results.results.get("error", 0) + 1
+                sync_results.media_type_counts["book"] = sync_results.media_type_counts.get("book", 0) + 1
+                sync_results.error_items.append({"title": title, "error": "Audiobookshelf check failed"})
+                print(f"⚠️  {title}: ebook in Komga, Audiobookshelf check failed ({i}/{len(book_items)})")
+            else:
+                sync_results.results["already_available"] = sync_results.results.get("already_available", 0) + 1
+                sync_results.media_type_counts["book"] = sync_results.media_type_counts.get("book", 0) + 1
+                present = []
+                if komga_match:
+                    present.append("Komga")
+                if audiobookshelf_match:
+                    present.append("Audiobookshelf")
+                print(f"☑️ {title}: Already in {' and '.join(present)} ({i}/{len(book_items)})")
+            continue
+
+        if komga_match or audiobookshelf_match:
+            present = []
+            if komga_match:
+                present.append("Komga")
+            if audiobookshelf_match:
+                present.append("Audiobookshelf")
+            missing = ", ".join(
+                name for name, wanted in (("ebook", want_ebook), ("audiobook", want_audiobook)) if wanted
+            )
+            print(f"➡️  {title}: already in {' + '.join(present)}, requesting {missing} ({i}/{len(book_items)})")
+
         try:
-            result = process_book_item(item, shelfmark_client, dry_run)
+            result = process_book_item(
+                item,
+                shelfmark_client,
+                dry_run,
+                want_ebook=want_ebook,
+                want_audiobook=want_audiobook,
+            )
             status = result["status"]
         except Exception as e:
             logging.error(f"❌ ERROR: Exception during book processing: {str(e)}")

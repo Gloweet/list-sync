@@ -277,6 +277,32 @@ def get_komga_config() -> Tuple[Optional[str], Optional[str]]:
     return url, api_key
 
 
+def get_audiobookshelf_config() -> Tuple[Optional[str], Optional[str]]:
+    """
+    Get Audiobookshelf (https://www.audiobookshelf.org/) URL and API key from
+    environment variables. Used to check whether a book already exists as an
+    audiobook before requesting it from Shelfmark.
+
+    Returns:
+        Tuple[Optional[str], Optional[str]]: Base URL and API key, or (None, None) if unset
+    """
+    if os.path.exists('.env'):
+        load_dotenv()
+
+    url = os.getenv('AUDIOBOOKSHELF_URL')
+    api_key = os.getenv('AUDIOBOOKSHELF_LIST_SYNC_API_KEY')
+    import logging
+    if url and api_key:
+        logging.info("Audiobookshelf configuration loaded from environment")
+    else:
+        logging.warning(
+            "AUDIOBOOKSHELF_URL/AUDIOBOOKSHELF_LIST_SYNC_API_KEY not set - "
+            "audiobook availability checks will be disabled"
+        )
+
+    return url, api_key
+
+
 def load_env_config(test_connection: bool = True) -> Tuple[Optional[str], Optional[str], Optional[str], float, bool, bool]:
     """
     Load configuration from database or environment variables (database preferred).
