@@ -1287,14 +1287,8 @@ def sync_books_to_shelfmark(
         if komga_client:
             try:
                 komga_match = komga_client.find_book_by_title_author(title, author)
-                if komga_match:
-                    if collection_tags:
-                        existing_tags = [t.get('name') for t in komga_match.get('tags', []) or []]
-                        for tag_name in collection_tags:
-                            if tag_name not in existing_tags:
-                                tag_id = komga_client.find_or_create_tag(tag_name)
-                                if tag_id:
-                                    komga_client.add_tag_to_book(komga_match.get('id'), tag_id)
+                if komga_match and collection_tags:
+                    komga_client.add_tags_to_book(komga_match.get('id'), collection_tags)
             except Exception as e:
                 logging.warning(f"Komga check failed for '{title}': {e}")
 
