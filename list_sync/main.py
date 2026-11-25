@@ -10,6 +10,7 @@ import signal
 import sys
 import threading
 import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Any, Optional, Tuple
 
@@ -846,6 +847,16 @@ def _release_language(release: Dict[str, Any]) -> Optional[str]:
     return language.value if language else None
 
 
+def _release_title_matches(release: Dict[str, Any], title: str) -> bool:
+    """Whether a release title contains the wanted book title (accent-folded)."""
+    def fold(value: str) -> str:
+        decomposed = unicodedata.normalize("NFKD", value or "")
+        return "".join(c for c in decomposed if not unicodedata.combining(c)).lower()
+
+    wanted = fold(title).strip()
+    return bool(wanted) and wanted in fold(release.get("title"))
+
+
 def _select_releases_by_profile(
     releases: List[Dict[str, Any]],
     profile: Optional[Dict[str, Any]],
@@ -902,10 +913,16 @@ def _select_releases_by_profile(
             satisfied = True
 
     if not chosen and not skipped_match and content_type == "ebook" and unknown:
-        chosen = [release for release in unknown if _release_language(release) not in skip][:1]
+        candidates = [release for release in unknown if _release_language(release) not in skip]
+        # Most ebook sources report no language at all. Prefer a release whose
+        # title actually contains the wanted title ("L'alchimiste") over a
+        # foreign edition ("El Alquimista").
+        titled = [release for release in candidates if _release_title_matches(release, title)]
+        chosen = (titled or candidates)[:1]
         if chosen:
             logging.info(
                 f"🌍 {title}: no ebook release matched the profile, keeping the first one with unknown language"
+                + (" (title match)" if titled else "")
             )
 
     wanted = ", ".join(_profile_languages(profile)) or "none"
