@@ -33,8 +33,9 @@ class KomgaClient:
             base_url = f"http://{base_url}" if has_port else f"http://{base_url}:8080"
         self.base_url = base_url.rstrip('/')
         self.api_key = api_key
+        # Komga authenticates API keys with X-API-Key, not a Bearer token.
         self.headers = {
-            "Authorization": f"Bearer {api_key}",
+            "X-API-Key": api_key,
             "Accept": "application/json",
         }
 

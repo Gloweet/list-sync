@@ -1218,6 +1218,13 @@ def sync_books_to_shelfmark(
     # Get Komga client if configured (ebook availability)
     komga_url, komga_api_key = get_komga_config()
     komga_client = KomgaClient(komga_url, komga_api_key) if (komga_url and komga_api_key) else None
+    if komga_client and not komga_client.test_connection():
+        # A bad/expired key must not produce one error per book for the whole
+        # run; without the check ListSync simply requests ebooks as before.
+        logging.warning(
+            "Komga rejected the API key - ebook presence checks disabled for this run"
+        )
+        komga_client = None
 
     # Get Audiobookshelf client if configured (audiobook availability)
     audiobookshelf_url, audiobookshelf_api_key = get_audiobookshelf_config()

@@ -118,12 +118,13 @@ def fetch_letterboxd_list(list_id: str) -> List[Dict[str, Any]]:
             # A page or a script that never returns used to block the whole
             # sync forever (Letterboxd lazy-load scroll). Timeouts make such a
             # page raise instead, so the list is marked failed and the sync
-            # moves on to the next one.
-            sb.set_page_load_timeout(60)
+            # moves on to the next one. SeleniumBase's SB wrapper exposes no
+            # timeout methods; the underlying WebDriver does.
             try:
-                sb.set_script_timeout(30)
-            except Exception:
-                logging.warning("SeleniumBase has no set_script_timeout - scrolling can still block")
+                sb.driver.set_page_load_timeout(60)
+                sb.driver.set_script_timeout(30)
+            except Exception as e:
+                logging.warning(f"Could not set Selenium timeouts ({e}); a stuck page can still block")
             max_pages = 100
             deadline = time.monotonic() + 600
 
