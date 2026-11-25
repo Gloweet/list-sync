@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any, Optional
 
 import requests
+from selenium.webdriver.common.by import By
 from seleniumbase import SB
 
 from . import register_provider, check_and_raise_if_cancelled, SyncCancelledException
@@ -122,7 +123,7 @@ def fetch_letterboxd_list(list_id: str) -> List[Dict[str, Any]]:
             # bounds DOM commands (find_elements) that page/script timeouts
             # do not cover when the renderer stops answering.
             try:
-                sb.driver.command_executor.set_timeout(90)
+                sb.driver.command_executor.set_timeout(45)
                 sb.driver.set_page_load_timeout(60)
                 sb.driver.set_script_timeout(30)
             except Exception as e:
@@ -189,7 +190,7 @@ def fetch_letterboxd_list(list_id: str) -> List[Dict[str, Any]]:
                 scroll_failed = False
                 for i in range(scroll_attempts):
                     try:
-                        sb.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                        sb.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
                     except Exception as e:
                         logging.warning(f"Letterboxd scroll timed out on page {page}: {e}")
                         scroll_failed = True
@@ -199,9 +200,9 @@ def fetch_letterboxd_list(list_id: str) -> List[Dict[str, Any]]:
                     # Also try scrolling to specific elements (for custom lists)
                     if not is_watchlist:
                         try:
-                            items = sb.find_elements("div.listitem.js-listitem")
+                            items = sb.driver.find_elements(By.CSS_SELECTOR, "div.listitem.js-listitem")
                             if items:
-                                sb.execute_script("arguments[0].scrollIntoView(true);", items[-1])
+                                sb.driver.execute_script("arguments[0].scrollIntoView(true);", items[-1])
                                 sb.sleep(1)
                         except Exception as e:
                             logging.warning(f"Letterboxd element scroll failed on page {page}: {e}")
@@ -217,11 +218,11 @@ def fetch_letterboxd_list(list_id: str) -> List[Dict[str, Any]]:
                 
                 if is_watchlist:
                     # Watchlists use li.griditem structure
-                    figures = sb.find_elements("li.griditem")
+                    figures = sb.driver.find_elements(By.CSS_SELECTOR, "li.griditem")
                     logging.info(f"Found {len(figures)} grid items (watchlist)")
                 else:
                     # Custom lists use detail view with figures
-                    figures = sb.find_elements("div.react-component.figure[data-item-name]")
+                    figures = sb.driver.find_elements(By.CSS_SELECTOR, "div.react-component.figure[data-item-name]")
                     logging.info(f"Found {len(figures)} figures (custom list)")
                 
                 # If we find 0 items, we've gone too far - break
@@ -291,10 +292,10 @@ def fetch_letterboxd_list(list_id: str) -> List[Dict[str, Any]]:
                     next_page_url = None
                     
                     # Look for pagination container first
-                    pagination_container = sb.find_elements("div.pagination")
+                    pagination_container = sb.driver.find_elements(By.CSS_SELECTOR, "div.pagination")
                     if pagination_container:
                         # Look for next button within pagination
-                        next_buttons = sb.find_elements("div.pagination a.next")
+                        next_buttons = sb.driver.find_elements(By.CSS_SELECTOR, "div.pagination a.next")
                         if next_buttons and len(next_buttons) > 0:
                             next_href = next_buttons[0].get_attribute("href")
                             if next_href:
@@ -308,7 +309,7 @@ def fetch_letterboxd_list(list_id: str) -> List[Dict[str, Any]]:
                     
                     # Fallback: also check for numbered pagination
                     if not has_next_page:
-                        page_links = sb.find_elements("div.pagination .paginate-pages a")
+                        page_links = sb.driver.find_elements(By.CSS_SELECTOR, "div.pagination .paginate-pages a")
                         if page_links:
                             # Find the highest page number
                             max_page = page
