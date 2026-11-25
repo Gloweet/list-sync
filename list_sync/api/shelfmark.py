@@ -94,7 +94,11 @@ class ShelfmarkClient:
             return None
 
     def get_releases(
-        self, provider: str, book_id: str, content_type: str = "ebook"
+        self,
+        provider: str,
+        book_id: str,
+        content_type: str = "ebook",
+        languages: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """
         List downloadable releases for a book identified by a metadata provider.
@@ -110,6 +114,9 @@ class ShelfmarkClient:
             provider (str): Metadata provider name (e.g. "hardcover")
             book_id (str): Provider-specific book id
             content_type (str): "ebook" or "audiobook"
+            languages (list[str], optional): Language codes to ask the
+                language-aware sources for (comma-separated on the wire).
+                Sources that ignore them are filtered client-side.
 
         Returns:
             List[Dict[str, Any]]: Available releases, each suitable to pass
@@ -121,6 +128,8 @@ class ShelfmarkClient:
         """
         releases_url = f"{self.base_url}/api/releases"
         params = {"provider": provider, "book_id": book_id, "content_type": content_type}
+        if languages:
+            params["languages"] = ",".join(languages)
         try:
             timeout = int(os.getenv("SHELFMARK_RELEASE_TIMEOUT", "310"))
         except ValueError:

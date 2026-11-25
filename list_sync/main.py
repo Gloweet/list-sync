@@ -20,7 +20,7 @@ from .api.shelfmark import ShelfmarkClient
 from .config import (
     load_config, load_env_config, load_env_lists, save_config,
     CONFIG_FILE, get_trakt_client_id, get_shelfmark_config, get_komga_config,
-    get_audiobookshelf_config
+    get_audiobookshelf_config, get_shelfmark_languages
 )
 from .database import (
     init_database, load_list_ids, save_list_id, delete_list,
@@ -802,6 +802,58 @@ def _pick_best_book(matches: List[Dict[str, Any]], author: Optional[str]) -> Dic
     return matches[0]
 
 
+_LANGUAGE_ALIASES = {
+    "french": "fr", "français": "fr", "francais": "fr", "fre": "fr", "fra": "fr",
+    "english": "en", "anglais": "en", "eng": "en",
+    "spanish": "es", "espagnol": "es", "español": "es", "spa": "es",
+    "portuguese": "pt", "portugais": "pt", "por": "pt",
+    "german": "de", "allemand": "de", "deu": "de", "ger": "de",
+    "italian": "it", "italien": "it", "ita": "it",
+    "dutch": "nl", "néerlandais": "nl", "nld": "nl", "dut": "nl",
+    "japanese": "ja", "japonais": "ja", "jpn": "ja",
+    "russian": "ru", "russe": "ru", "rus": "ru",
+    "chinese": "zh", "chinois": "zh", "zho": "zh", "chi": "zh",
+}
+
+
+def _normalize_language_code(value: Optional[str]) -> Optional[str]:
+    """Map a language name or ISO 639-2 code to its ISO 639-1 code."""
+    if not value:
+        return None
+    text = str(value).strip().lower()
+    if text in _LANGUAGE_ALIASES:
+        return _LANGUAGE_ALIASES[text]
+    if len(text) >= 2 and text[:2].isalpha():
+        return text[:2]
+    return None
+
+
+def _filter_releases_by_language(
+    releases: List[Dict[str, Any]], languages: List[str], title: str
+) -> List[Dict[str, Any]]:
+    """Keep releases whose known language is wanted; drop unknown-language ones.
+
+    Audiobook sources are not language-aware (AudiobookBay ignores Shelfmark's
+    BOOK_LANGUAGE), and an absent language is not evidence of the wanted one:
+    picking a release with no language queued English audiobooks for French
+    books. Unknown is therefore dropped too.
+    """
+    kept = []
+    seen = set()
+    for release in releases:
+        code = _normalize_language_code(release.get("language"))
+        if code:
+            seen.add(code)
+        if code in languages:
+            kept.append(release)
+    if len(kept) != len(releases):
+        logging.info(
+            f"🌍 {title}: kept {len(kept)}/{len(releases)} audiobook release(s) "
+            f"in {languages} (found: {', '.join(sorted(seen)) or 'unknown'})"
+        )
+    return kept
+
+
 def process_book_item(
     item: Dict[str, Any],
     shelfmark_client: ShelfmarkClient,
@@ -917,9 +969,13 @@ def process_book_item(
             result["status"] = "already_available"
             return result
 
+        audiobook_languages = get_shelfmark_languages()
         format_statuses: Dict[str, str] = {}
         for content_type in content_types:
-            releases = shelfmark_client.get_releases(provider, provider_id, content_type=content_type)
+            languages = audiobook_languages if content_type == "audiobook" else None
+            releases = shelfmark_client.get_releases(
+                provider, provider_id, content_type=content_type, languages=languages or None
+            )
             if releases is None:
                 logging.warning(
                     f"⚠️  Shelfmark: {content_type} release search failed for '{title}' "
@@ -927,6 +983,8 @@ def process_book_item(
                 )
                 format_statuses[content_type] = "error"
                 continue
+            if languages:
+                releases = _filter_releases_by_language(releases, languages, title)
             if not releases:
                 logging.warning(f"⚠️  Shelfmark: no {content_type} releases found for '{title}' ({external_id})")
                 format_statuses[content_type] = "not_found"
