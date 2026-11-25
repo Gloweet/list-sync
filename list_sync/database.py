@@ -790,35 +790,41 @@ def create_language_profile_tables():
 def seed_default_language_profiles():
     """Ensure each format has a default profile (French first, then fallbacks)."""
     for kind in PROFILE_KINDS:
-        with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT id FROM language_profiles WHERE kind = ? LIMIT 1", (kind,))
-            existing = cursor.fetchone()
-            if existing:
-                cursor.execute(
-                    "SELECT 1 FROM language_profiles WHERE kind = ? AND is_default = 1 LIMIT 1", (kind,)
-                )
-                if cursor.fetchone() is None:
+        try:
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT id FROM language_profiles WHERE kind = ? LIMIT 1", (kind,))
+                existing = cursor.fetchone()
+                if existing:
                     cursor.execute(
-                        "UPDATE language_profiles SET is_default = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                        (existing[0],),
+                        "SELECT 1 FROM language_profiles WHERE kind = ? AND is_default = 1 LIMIT 1",
+                        (kind,),
                     )
-                    conn.commit()
-                continue
+                    if cursor.fetchone() is None:
+                        cursor.execute(
+                            "UPDATE language_profiles SET is_default = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                            (existing[0],),
+                        )
+                        conn.commit()
+                    continue
 
-            cursor.execute(
-                "INSERT INTO language_profiles (name, kind, is_default) VALUES (?, ?, 1)",
-                (DEFAULT_PROFILE_NAMES[kind], kind),
-            )
-            profile_id = cursor.lastrowid
-            for position, (language, criteria) in enumerate(DEFAULT_PROFILE_ROWS):
                 cursor.execute(
-                    """INSERT INTO language_profile_rows (profile_id, position, language, search_criteria)
-                       VALUES (?, ?, ?, ?)""",
-                    (profile_id, position, language, criteria),
+                    "INSERT INTO language_profiles (name, kind, is_default) VALUES (?, ?, 1)",
+                    (DEFAULT_PROFILE_NAMES[kind], kind),
                 )
-            conn.commit()
-            logging.info(f"Seeded default {kind} language profile (id {profile_id})")
+                profile_id = cursor.lastrowid
+                for position, (language, criteria) in enumerate(DEFAULT_PROFILE_ROWS):
+                    cursor.execute(
+                        """INSERT INTO language_profile_rows (profile_id, position, language, search_criteria)
+                           VALUES (?, ?, ?, ?)""",
+                        (profile_id, position, language, criteria),
+                    )
+                conn.commit()
+                logging.info(f"Seeded default {kind} language profile (id {profile_id})")
+        except sqlite3.IntegrityError:
+            # The API server and the sync core both initialize the schema at
+            # startup; losing the race is fine, the other process seeded it.
+            logging.info(f"Default {kind} language profile already seeded by another process")
 
 
 def _language_profile_from_row(cursor, row) -> Dict[str, Any]:
