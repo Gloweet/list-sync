@@ -3,7 +3,11 @@ Letterboxd provider for ListSync.
 """
 
 import logging
+import multiprocessing
+import os
+import queue
 import re
+import signal
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any, Optional
@@ -100,8 +104,85 @@ def _determine_media_type(title: str) -> str:
     return "movie"
 
 
+def _letterboxd_worker(list_id: str, out_queue):
+    """Child-process entry point: own session, so the parent can kill the
+    whole group (Python + ChromeDriver + Chrome) if it stops answering."""
+    try:
+        os.setsid()
+    except Exception:
+        pass
+    try:
+        out_queue.put(("ok", _fetch_letterboxd_list_impl(list_id)))
+    except BaseException as exc:  # noqa: BLE001 - reported to the parent
+        try:
+            out_queue.put(("error", f"{type(exc).__name__}: {exc}"))
+        except Exception:
+            pass
+
+
+def _kill_worker(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    try:
+        proc.join(10)
+    except Exception:
+        pass
+
+
+def _fetch_letterboxd_isolated(list_id: str, timeout: int = 240) -> List[Dict[str, Any]]:
+    """Run the scrape in a killable child process.
+
+    An unresponsive renderer can leave a WebDriver command blocked past every
+    client-side timeout; only killing the process (and its Chrome) reliably
+    bounds it.
+    """
+    ctx = multiprocessing.get_context("spawn")
+    out_queue = ctx.Queue()
+    proc = ctx.Process(target=_letterboxd_worker, args=(list_id, out_queue))
+    proc.start()
+    try:
+        deadline = time.monotonic() + timeout
+        while proc.is_alive() and time.monotonic() < deadline:
+            check_and_raise_if_cancelled()
+            proc.join(1)
+    except BaseException:
+        _kill_worker(proc)
+        raise
+
+    if proc.is_alive():
+        _kill_worker(proc)
+        raise TimeoutError(f"Letterboxd scrape exceeded {timeout}s and was killed")
+
+    try:
+        status, payload = out_queue.get(timeout=10)
+    except queue.Empty:
+        raise RuntimeError("Letterboxd worker returned no result")
+    if status != "ok":
+        raise RuntimeError(payload)
+    return payload
+
+
 @register_provider("letterboxd")
 def fetch_letterboxd_list(list_id: str) -> List[Dict[str, Any]]:
+    """
+    Fetch a Letterboxd list in an isolated, killable worker process.
+
+    Args:
+        list_id (str): Letterboxd list ID (username/list-slug) or full URL
+
+    Returns:
+        List[Dict[str, Any]]: List of media items
+    """
+    logging.info(f"Fetching Letterboxd list in an isolated worker: {list_id}")
+    return _fetch_letterboxd_isolated(list_id)
+
+
+def _fetch_letterboxd_list_impl(list_id: str) -> List[Dict[str, Any]]:
     """
     Fetch Letterboxd list using Selenium with pagination, supporting both regular lists and watchlists
     
