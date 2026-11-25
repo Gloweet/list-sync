@@ -1208,6 +1208,26 @@ def _resolve_language_profile(
     return profile
 
 
+def _trigger_library_scans(
+    komga_client: Optional[KomgaClient],
+    audiobookshelf_client: Optional[Any],
+    reason: str,
+) -> None:
+    """Rescan Komga/Audiobookshelf so downloaded files are visible.
+
+    Both libraries watch an NFS volume, where inotify events do not propagate:
+    a file dropped by qBittorrent stays invisible until a scan runs.
+    """
+    for name, client in (("Komga", komga_client), ("Audiobookshelf", audiobookshelf_client)):
+        if client is None:
+            continue
+        try:
+            scanned = client.scan_libraries()
+            logging.info(f"🔄 {name}: library scan triggered ({reason}, {scanned} librar{'y' if scanned == 1 else 'ies'})")
+        except Exception as e:
+            logging.warning(f"🔄 {name}: could not trigger a library scan ({reason}): {e}")
+
+
 def sync_books_to_shelfmark(
     book_items: List[Dict[str, Any]],
     shelfmark_client: Optional[ShelfmarkClient],
@@ -1273,6 +1293,9 @@ def sync_books_to_shelfmark(
         return
 
     print(f"\n📚  Processing {len(book_items)} book items...")
+    # Make the libraries reflect the filesystem before the presence checks,
+    # otherwise a book downloaded since the last scan is requested again.
+    _trigger_library_scans(komga_client, audiobookshelf_client, "before book checks")
     for i, item in enumerate(book_items, 1):
         if check_cancellation_requested():
             logging.warning(f"⚠️ Cancellation detected during book processing at item {i}/{len(book_items)}")
@@ -1387,9 +1410,8 @@ def sync_books_to_shelfmark(
         title = item.get('title', 'Unknown')
         if status == "requested":
             print(f"✅ {title}: Successfully Requested ({i}/{len(book_items)})")
-            # Note: We cannot tag in Komga immediately since the book will be
-            # downloaded by Shelfmark/qBittorrent and added to Komga on next scan.
-            # On next sync, the book will be found in Komga and tagged then.
+            # The book is downloaded by Shelfmark/qBittorrent and enters Komga
+            # on the scan triggered below, then gets tagged on the next sync.
         elif status == "skipped":
             print(f"⏭️  {title}: Skipped ({i}/{len(book_items)})")
         elif status == "already_available":
@@ -1401,6 +1423,16 @@ def sync_books_to_shelfmark(
             print(f"❓ {title}: {status} ({i}/{len(book_items)})")
             if status in ("error", "request_failed"):
                 sync_results.error_items.append({"title": title, "error": result.get("error_message", "Unknown error")})
+
+    # Downloads finish after this function returns; rescan once more so they
+    # appear without waiting for the next daily sync.
+    if komga_client or audiobookshelf_client:
+        delayed_scan = threading.Timer(
+            900,
+            lambda: _trigger_library_scans(komga_client, audiobookshelf_client, "after downloads"),
+        )
+        delayed_scan.daemon = True
+        delayed_scan.start()
 
 
 def sync_media_to_overseerr(

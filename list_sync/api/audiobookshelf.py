@@ -54,6 +54,29 @@ class AudiobookshelfClient:
         response.raise_for_status()
         return response.json()
 
+    def _post(self, path: str) -> None:
+        """POST to an ABS endpoint (used for admin actions like library scans)."""
+        response = requests.post(f"{self.base_url}{path}", headers=self.headers, timeout=30)
+        response.raise_for_status()
+
+    def scan_libraries(self) -> int:
+        """Ask ABS to rescan every book library.
+
+        The media volume is NFS, so ABS's folder watcher never sees files
+        downloaded by qBittorrent; a scan is what makes them appear.
+
+        Returns:
+            Number of libraries scanned. Raises on permission/transport error.
+        """
+        libraries = self._get("/api/libraries").get("libraries", []) or []
+        scanned = 0
+        for library in libraries:
+            if library.get("mediaType") != "book":
+                continue
+            self._post(f"/api/libraries/{library['id']}/scan")
+            scanned += 1
+        return scanned
+
     def _resolve_library_id(self) -> str:
         if self.library_id:
             return self.library_id

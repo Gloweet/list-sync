@@ -144,6 +144,25 @@ class KomgaClient:
         # Komga's search is relevance-ranked; fall back to its first result.
         return self._with_language(matches[0])
 
+    def scan_libraries(self) -> int:
+        """Ask Komga to rescan every library.
+
+        The media volume is NFS, so Komga's watcher does not reliably see
+        files downloaded by qBittorrent; a scan is what makes them appear.
+
+        Returns:
+            Number of libraries scanned. Raises on permission/transport error.
+        """
+        libraries = self._request("GET", "/api/v1/libraries")
+        if libraries is None:
+            raise RuntimeError("Komga: could not list libraries")
+        scanned = 0
+        for library in libraries:
+            if self._request("POST", f"/api/v1/libraries/{library['id']}/scan") is None:
+                raise RuntimeError(f"Komga: scan failed for library '{library.get('name')}'")
+            scanned += 1
+        return scanned
+
     def add_tags_to_book(self, book_id: str, tags: List[str]) -> bool:
         """Add tags to a book's metadata (Komga tags are plain strings)."""
         book = self.get_book(book_id)
