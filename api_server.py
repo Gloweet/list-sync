@@ -46,7 +46,6 @@ from list_sync.database import (
     get_list_settings,
     update_list_settings,
     get_language_profiles,
-    get_language_profile,
     create_language_profile,
     update_language_profile,
     delete_language_profile,

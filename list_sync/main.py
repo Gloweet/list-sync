@@ -868,10 +868,10 @@ def _select_releases_by_profile(
     language are kept as a last resort, because most ebook sources (Prowlarr)
     do not report one.
     """
+    skip = skip_languages or set()
     rows = sorted((profile or {}).get("rows") or [], key=lambda row: row.get("position", 0))
     if not rows:
-        return releases[:1]
-    skip = skip_languages or set()
+        return [release for release in releases if _release_language(release) not in skip][:1]
 
     by_language: Dict[str, Dict[str, Any]] = {}
     unknown: List[Dict[str, Any]] = []

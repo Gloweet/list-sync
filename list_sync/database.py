@@ -726,15 +726,18 @@ def update_list_settings(list_type: str, list_id: str, changes: Dict[str, Any]) 
             values.append(value)
 
     if assignments:
-        with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                f"UPDATE lists SET {', '.join(assignments)} WHERE list_type = ? AND list_id = ?",
-                (*values, list_type, list_id),
-            )
-            if cursor.rowcount == 0:
-                raise ValueError(f"List not found: {list_type}/{list_id}")
-            conn.commit()
+        try:
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    f"UPDATE lists SET {', '.join(assignments)} WHERE list_type = ? AND list_id = ?",
+                    (*values, list_type, list_id),
+                )
+                if cursor.rowcount == 0:
+                    raise ValueError(f"List not found: {list_type}/{list_id}")
+                conn.commit()
+        except sqlite3.IntegrityError:
+            raise ValueError(f"A list named '{changes.get('name')}' already exists")
 
     return get_list_settings(list_type, list_id)
 
