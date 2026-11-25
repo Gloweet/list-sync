@@ -96,6 +96,42 @@ export function useApiService() {
       })
     },
 
+    async updateList(listType: string, listId: string, changes: Record<string, any>) {
+      return apiCall(`${baseURL}/lists/${listType}/${encodeURIComponent(listId)}`, {
+        method: 'PATCH',
+        body: changes,
+      })
+    },
+
+    // Book language profiles
+    async getLanguages() {
+      return apiCall(`${baseURL}/languages`)
+    },
+
+    async getLanguageProfiles() {
+      return apiCall(`${baseURL}/language-profiles`)
+    },
+
+    async createLanguageProfile(profile: Record<string, any>) {
+      return apiCall(`${baseURL}/language-profiles`, {
+        method: 'POST',
+        body: profile,
+      })
+    },
+
+    async updateLanguageProfile(profileId: number, changes: Record<string, any>) {
+      return apiCall(`${baseURL}/language-profiles/${profileId}`, {
+        method: 'PUT',
+        body: changes,
+      })
+    },
+
+    async deleteLanguageProfile(profileId: number) {
+      return apiCall(`${baseURL}/language-profiles/${profileId}`, {
+        method: 'DELETE',
+      })
+    },
+
     async validateList(url: string) {
       return apiCall(`${baseURL}/lists/validate`, {
         method: 'POST',

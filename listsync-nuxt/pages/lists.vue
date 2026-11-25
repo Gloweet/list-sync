@@ -222,6 +222,7 @@
       @sync="handleSyncList"
       @delete="handleDeleteList"
       @view-items="handleViewItems"
+      @updated="handleListUpdated"
     />
 
     <!-- Delete Confirmation Modal -->
@@ -1083,6 +1084,18 @@ const handleDeleteConfirm = async (dontAskAgain: boolean) => {
   } catch (error: any) {
     showError('Delete Failed', error.message)
   }
+}
+
+// Refresh after a rename / download-settings save in the details modal
+const handleListUpdated = async () => {
+  await listsStore.refresh()
+  if (!selectedList.value) return
+  const refreshed = listsStore.lists.find(
+    (list) =>
+      list.list_type === selectedList.value!.list_type &&
+      list.list_id === selectedList.value!.list_id
+  )
+  if (refreshed) selectedList.value = refreshed
 }
 
 // Open list details

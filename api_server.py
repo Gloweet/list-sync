@@ -42,8 +42,16 @@ from list_sync.database import (
     save_list_id,
     delete_list,
     DB_FILE,
-    init_database
+    init_database,
+    get_list_settings,
+    update_list_settings,
+    get_language_profiles,
+    get_language_profile,
+    create_language_profile,
+    update_language_profile,
+    delete_language_profile,
 )
+from list_sync.languages import language_options
 from list_sync.config import load_env_config
 # Removed in-memory sync tracker - now using database-based tracking
 
@@ -128,6 +136,27 @@ class ListAdd(BaseModel):
     list_type: str
     list_id: str
     user_id: str = "1"
+
+class ListSettingsUpdate(BaseModel):
+    name: Optional[str] = None
+    download_ebooks: Optional[bool] = None
+    download_audiobooks: Optional[bool] = None
+    ebook_language_profile_id: Optional[int] = None
+    audiobook_language_profile_id: Optional[int] = None
+
+class LanguageRowModel(BaseModel):
+    language: str
+    search_criteria: str = "always"
+
+class LanguageProfileCreate(BaseModel):
+    name: str
+    kind: str = "ebook"
+    rows: List[LanguageRowModel] = []
+
+class LanguageProfileUpdate(BaseModel):
+    name: Optional[str] = None
+    rows: Optional[List[LanguageRowModel]] = None
+    is_default: Optional[bool] = None
 
 class ProcessInfo(BaseModel):
     pid: int
@@ -3108,10 +3137,15 @@ async def get_lists():
                 "list_type": list_item['type'],
                 "list_id": list_item['id'],
                 "list_url": list_item.get('url'),  # Include the stored URL
-                "display_name": display_name,
+                "name": list_item.get('name'),
+                "display_name": list_item.get('name') or display_name,
                 "item_count": list_item.get('item_count', 0),  # Include item count from database
                 "last_synced": last_synced,  # Include converted last_synced timestamp
-                "user_id": list_item.get('user_id', '1')  # Include user_id for per-list user assignment
+                "user_id": list_item.get('user_id', '1'),  # Include user_id for per-list user assignment
+                "download_ebooks": list_item.get('download_ebooks', True),
+                "download_audiobooks": list_item.get('download_audiobooks', True),
+                "ebook_language_profile_id": list_item.get('ebook_language_profile_id'),
+                "audiobook_language_profile_id": list_item.get('audiobook_language_profile_id'),
             })
         
         return {"lists": formatted_lists}
@@ -3262,6 +3296,105 @@ async def delete_list_endpoint(list_type: str, list_id: str):
     except Exception as e:
         logging.error(f"Error deleting list {list_type}/{list_id}: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.patch("/api/lists/{list_type}/{list_id:path}")
+async def update_list_endpoint(list_type: str, list_id: str, update: ListSettingsUpdate):
+    """Rename a list or change its book download / language-profile settings."""
+    try:
+        changes = {}
+        for field in update.model_fields_set:
+            value = getattr(update, field)
+            if field in ("download_ebooks", "download_audiobooks") and value is None:
+                continue
+            changes[field] = value
+        settings = update_list_settings(list_type, list_id, changes)
+        return {"success": True, **settings}
+    except ValueError as e:
+        status = 409 if "already exists" in str(e) else 400
+        raise HTTPException(status_code=status, detail=str(e))
+    except Exception as e:
+        logging.error(f"Error updating list {list_type}/{list_id}: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==========================================
+# Book language profiles
+# ==========================================
+
+_SEARCH_CRITERIA_OPTIONS = [
+    {"value": "always", "label": "Always search in this language"},
+    {"value": "if_not_found", "label": "Only if not found in the earlier languages"},
+]
+
+
+def _profile_http_error(exc: ValueError) -> HTTPException:
+    status = 409 if "already exists" in str(exc) else 400
+    return HTTPException(status_code=status, detail=str(exc))
+
+
+@app.get("/api/languages")
+async def get_languages():
+    """Languages and search criteria usable in a language profile."""
+    return {
+        "languages": language_options(),
+        "search_criteria": _SEARCH_CRITERIA_OPTIONS,
+        "kinds": [
+            {"value": "ebook", "label": "Ebook"},
+            {"value": "audiobook", "label": "Audiobook"},
+        ],
+    }
+
+
+@app.get("/api/language-profiles")
+async def list_language_profiles():
+    """Get every language profile with its ordered rows."""
+    try:
+        return {"profiles": get_language_profiles()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/language-profiles")
+async def create_language_profile_endpoint(body: LanguageProfileCreate):
+    """Create a language profile."""
+    try:
+        profile = create_language_profile(
+            body.name, body.kind, [row.model_dump() for row in body.rows]
+        )
+        return {"success": True, "profile": profile}
+    except ValueError as e:
+        raise _profile_http_error(e)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/language-profiles/{profile_id}")
+async def update_language_profile_endpoint(profile_id: int, body: LanguageProfileUpdate):
+    """Update a profile's name, rows and/or default flag."""
+    try:
+        profile = update_language_profile(
+            profile_id,
+            name=body.name,
+            rows=[row.model_dump() for row in body.rows] if body.rows is not None else None,
+            is_default=True if body.is_default else None,
+        )
+        return {"success": True, "profile": profile}
+    except ValueError as e:
+        raise _profile_http_error(e)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/language-profiles/{profile_id}")
+async def delete_language_profile_endpoint(profile_id: int):
+    """Delete a language profile (the default one cannot be deleted)."""
+    try:
+        if not delete_language_profile(profile_id):
+            raise HTTPException(status_code=404, detail=f"Language profile {profile_id} not found")
+        return {"success": True}
+    except ValueError as e:
+        raise _profile_http_error(e)
+
 
 @app.get("/api/items")
 async def get_items(page: int = Query(1, ge=1), limit: int = Query(50, ge=1, le=100)):

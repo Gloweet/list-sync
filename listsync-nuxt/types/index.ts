@@ -22,11 +22,36 @@ export interface List {
   list_id: string
   list_url?: string
   url?: string
+  name?: string | null
   display_name: string
   item_count: number
   status?: string
   last_synced?: string
   user_id?: string
+  download_ebooks?: boolean
+  download_audiobooks?: boolean
+  ebook_language_profile_id?: number | null
+  audiobook_language_profile_id?: number | null
+}
+
+export interface LanguageOption {
+  value: string
+  label: string
+}
+
+export interface LanguageRow {
+  id?: number
+  position?: number
+  language: string
+  search_criteria: 'always' | 'if_not_found'
+}
+
+export interface LanguageProfile {
+  id: number
+  name: string
+  kind: 'ebook' | 'audiobook'
+  is_default: boolean
+  rows: LanguageRow[]
 }
 
 export interface MediaItem {
@@ -67,7 +92,7 @@ export interface ConnectionStatus {
 }
 
 export interface CreateListRequest {
-  list_type: 'imdb' | 'trakt' | 'trakt_special' | 'letterboxd' | 'mdblist' | 'stevenlu' | 'tmdb' | 'simkl' | 'tvdb'
+  list_type: 'imdb' | 'trakt' | 'trakt_special' | 'letterboxd' | 'mdblist' | 'stevenlu' | 'tmdb' | 'simkl' | 'tvdb' | 'anilist' | 'babelio'
   list_id: string
   user_id?: string
 }

@@ -20,14 +20,16 @@ from .api.shelfmark import ShelfmarkClient
 from .config import (
     load_config, load_env_config, load_env_lists, save_config,
     CONFIG_FILE, get_trakt_client_id, get_shelfmark_config, get_komga_config,
-    get_audiobookshelf_config, get_shelfmark_languages
+    get_audiobookshelf_config
 )
 from .database import (
     init_database, load_list_ids, save_list_id, delete_list,
     load_sync_interval, configure_sync_interval, should_sync_item, should_sync_book,
     save_sync_result, update_list_item_count, update_list_sync_info, DB_FILE,
-    start_sync_in_db, end_sync_in_db, add_item_to_sync, update_sync_lists_in_db
+    start_sync_in_db, end_sync_in_db, add_item_to_sync, update_sync_lists_in_db,
+    get_list_settings, get_language_profile, get_default_language_profile
 )
+from .languages import detect_language_in_text, normalize_language
 from .notifications.discord import send_to_discord_webhook
 from .providers import get_provider, get_available_providers, SyncCancelledException
 from .ui.cli import handle_menu_choice, manage_lists
@@ -277,6 +279,9 @@ def fetch_media_from_lists(list_ids: List[Dict[str, str]], is_single_list: bool 
         list_type = list_info["type"]
         list_id = list_info["id"]
         list_user_id = list_info.get("user_id", "1")
+        # Per-list book settings (display name, download flags, language
+        # profiles). Carried on every item so the book sync can use them.
+        book_settings = get_list_settings(list_type, list_id)
         
         try:
             # Display progress message to user
@@ -304,6 +309,7 @@ def fetch_media_from_lists(list_ids: List[Dict[str, str]], is_single_list: bool 
                         item['_source_list_type'] = list_type
                         item['_source_list_id'] = list_id
                         item['_source_list_user_id'] = list_user_id
+                        item['_book_settings'] = book_settings
                         valid_items.append(item)
                     else:
                         logging.warning(f"Skipping item with empty title from {list_type.upper()} list: {list_id}")
@@ -370,7 +376,12 @@ def fetch_media_from_lists(list_ids: List[Dict[str, str]], is_single_list: bool 
         
         # Track which list this item came from
         list_user_id = item.get('_source_list_user_id', "1")
-        list_info = {'type': list_type, 'id': list_id, 'user_id': list_user_id}
+        list_info = {
+            'type': list_type,
+            'id': list_id,
+            'user_id': list_user_id,
+            **(item.get('_book_settings') or {}),
+        }
         
         # Try to match by IMDb ID first (most reliable)
         if imdb_id:
@@ -802,56 +813,107 @@ def _pick_best_book(matches: List[Dict[str, Any]], author: Optional[str]) -> Dic
     return matches[0]
 
 
-_LANGUAGE_ALIASES = {
-    "french": "fr", "français": "fr", "francais": "fr", "fre": "fr", "fra": "fr",
-    "english": "en", "anglais": "en", "eng": "en",
-    "spanish": "es", "espagnol": "es", "español": "es", "spa": "es",
-    "portuguese": "pt", "portugais": "pt", "por": "pt",
-    "german": "de", "allemand": "de", "deu": "de", "ger": "de",
-    "italian": "it", "italien": "it", "ita": "it",
-    "dutch": "nl", "néerlandais": "nl", "nld": "nl", "dut": "nl",
-    "japanese": "ja", "japonais": "ja", "jpn": "ja",
-    "russian": "ru", "russe": "ru", "rus": "ru",
-    "chinese": "zh", "chinois": "zh", "zho": "zh", "chi": "zh",
-}
+def _profile_languages(profile: Optional[Dict[str, Any]]) -> List[str]:
+    """Language codes of a profile, in preference order."""
+    rows = sorted((profile or {}).get("rows") or [], key=lambda row: row.get("position", 0))
+    return [row["language"] for row in rows]
 
 
-def _normalize_language_code(value: Optional[str]) -> Optional[str]:
-    """Map a language name or ISO 639-2 code to its ISO 639-1 code."""
-    if not value:
-        return None
-    text = str(value).strip().lower()
-    if text in _LANGUAGE_ALIASES:
-        return _LANGUAGE_ALIASES[text]
-    if len(text) >= 2 and text[:2].isalpha():
-        return text[:2]
-    return None
+def _primary_profile_languages(profile: Optional[Dict[str, Any]]) -> List[str]:
+    """Languages that count as "the ones we actually want" for a library check.
 
-
-def _filter_releases_by_language(
-    releases: List[Dict[str, Any]], languages: List[str], title: str
-) -> List[Dict[str, Any]]:
-    """Keep releases whose known language is wanted; drop unknown-language ones.
-
-    Audiobook sources are not language-aware (AudiobookBay ignores Shelfmark's
-    BOOK_LANGUAGE), and an absent language is not evidence of the wanted one:
-    picking a release with no language queued English audiobooks for French
-    books. Unknown is therefore dropped too.
+    A "if_not_found" row is a fallback: a library copy in that language must
+    not stop us from asking for the preferred language, otherwise an existing
+    English audiobook would block the French one forever.
     """
-    kept = []
-    seen = set()
-    for release in releases:
-        code = _normalize_language_code(release.get("language"))
-        if code:
-            seen.add(code)
-        if code in languages:
-            kept.append(release)
-    if len(kept) != len(releases):
-        logging.info(
-            f"🌍 {title}: kept {len(kept)}/{len(releases)} audiobook release(s) "
-            f"in {languages} (found: {', '.join(sorted(seen)) or 'unknown'})"
+    rows = sorted((profile or {}).get("rows") or [], key=lambda row: row.get("position", 0))
+    primary = [row["language"] for row in rows if row.get("search_criteria", "always") == "always"]
+    if primary:
+        return primary
+    return [rows[0]["language"]] if rows else []
+
+
+def _release_language(release: Dict[str, Any]) -> Optional[str]:
+    """Language of a Shelfmark release as an ISO 639-1 code, or None."""
+    language = normalize_language(release.get("language"))
+    if language is None:
+        # Ebook releases from Prowlarr usually carry no language field, but
+        # the release title often does ("...[Spanish]", "... French").
+        language = (
+            detect_language_in_text(release.get("title"))
+            or detect_language_in_text(release.get("series"))
         )
-    return kept
+    return language.value if language else None
+
+
+def _select_releases_by_profile(
+    releases: List[Dict[str, Any]],
+    profile: Optional[Dict[str, Any]],
+    content_type: str,
+    title: str,
+    skip_languages: Optional[set] = None,
+) -> List[Dict[str, Any]]:
+    """Pick the releases to queue according to the ordered language profile.
+
+    Rows are evaluated in order. A row whose criteria is "always" is always
+    considered; "if_not_found" rows are only considered while no earlier row
+    produced a release, which gives the fallback behaviour (French, else
+    English, else German, else Portuguese).
+
+    Releases in `skip_languages` are never queued: the library already holds
+    that language, so re-downloading it would only create a duplicate.
+
+    Audiobook releases with an unknown language are dropped: that is what
+    queued English audiobooks for French books. Ebook releases with an unknown
+    language are kept as a last resort, because most ebook sources (Prowlarr)
+    do not report one.
+    """
+    rows = sorted((profile or {}).get("rows") or [], key=lambda row: row.get("position", 0))
+    if not rows:
+        return releases[:1]
+    skip = skip_languages or set()
+
+    by_language: Dict[str, Dict[str, Any]] = {}
+    unknown: List[Dict[str, Any]] = []
+    found = set()
+    for release in releases:
+        code = _release_language(release)
+        if code:
+            found.add(code)
+            by_language.setdefault(code, release)
+        elif content_type != "audiobook":
+            unknown.append(release)
+
+    chosen: List[Dict[str, Any]] = []
+    satisfied = False
+    skipped_match = False
+    for row in rows:
+        if row.get("search_criteria") == "if_not_found" and satisfied:
+            continue
+        language = row.get("language")
+        if language in skip:
+            if language in by_language:
+                skipped_match = True
+            logging.info(f"🌍 {title}: skipping {language} {content_type} release, already in library")
+            continue
+        release = by_language.get(language)
+        if release is not None:
+            chosen.append(release)
+            satisfied = True
+
+    if not chosen and not skipped_match and content_type == "ebook" and unknown:
+        chosen = [release for release in unknown if _release_language(release) not in skip][:1]
+        if chosen:
+            logging.info(
+                f"🌍 {title}: no ebook release matched the profile, keeping the first one with unknown language"
+            )
+
+    wanted = ", ".join(_profile_languages(profile)) or "none"
+    logging.info(
+        f"🌍 {title}: kept {len(chosen)}/{len(releases)} {content_type} release(s) "
+        f"for profile [{wanted}] (found: {', '.join(sorted(found)) or 'unknown'})"
+    )
+    return chosen
 
 
 def process_book_item(
@@ -860,6 +922,10 @@ def process_book_item(
     dry_run: bool,
     want_ebook: bool = True,
     want_audiobook: bool = False,
+    ebook_profile: Optional[Dict[str, Any]] = None,
+    audiobook_profile: Optional[Dict[str, Any]] = None,
+    ebook_skip_languages: Optional[set] = None,
+    audiobook_skip_languages: Optional[set] = None,
 ) -> Dict[str, Any]:
     """
     Process a single book item for sync to Shelfmark.
@@ -881,6 +947,10 @@ def process_book_item(
         dry_run (bool): Whether to perform a dry run
         want_ebook (bool): Whether to request an ebook release
         want_audiobook (bool): Whether to request an audiobook release
+        ebook_profile (dict, optional): Ebook language profile (ordered rows)
+        audiobook_profile (dict, optional): Audiobook language profile
+        ebook_skip_languages (set, optional): Languages already in the ebook library
+        audiobook_skip_languages (set, optional): Languages already in the audiobook library
 
     Returns:
         Dict[str, Any]: Processing result
@@ -969,12 +1039,15 @@ def process_book_item(
             result["status"] = "already_available"
             return result
 
-        audiobook_languages = get_shelfmark_languages()
+        profiles = {"ebook": ebook_profile, "audiobook": audiobook_profile}
+        skips = {"ebook": ebook_skip_languages, "audiobook": audiobook_skip_languages}
         format_statuses: Dict[str, str] = {}
         for content_type in content_types:
-            languages = audiobook_languages if content_type == "audiobook" else None
+            profile = profiles.get(content_type)
+            skip_languages = skips.get(content_type) or set()
             releases = shelfmark_client.get_releases(
-                provider, provider_id, content_type=content_type, languages=languages or None
+                provider, provider_id, content_type=content_type,
+                languages=_profile_languages(profile) or None,
             )
             if releases is None:
                 logging.warning(
@@ -983,25 +1056,39 @@ def process_book_item(
                 )
                 format_statuses[content_type] = "error"
                 continue
-            if languages:
-                releases = _filter_releases_by_language(releases, languages, title)
-            if not releases:
-                logging.warning(f"⚠️  Shelfmark: no {content_type} releases found for '{title}' ({external_id})")
-                format_statuses[content_type] = "not_found"
+            picked = _select_releases_by_profile(
+                releases, profile, content_type, title, skip_languages=skip_languages
+            )
+            if not picked:
+                if skip_languages and any(_release_language(r) in skip_languages for r in releases):
+                    logging.info(
+                        f"☑️  {title}: no {content_type} in the preferred language; "
+                        f"the library copy is already the best available"
+                    )
+                    format_statuses[content_type] = "already_available"
+                else:
+                    logging.warning(f"⚠️  Shelfmark: no matching {content_type} release for '{title}' ({external_id})")
+                    format_statuses[content_type] = "not_found"
                 continue
 
-            queued = shelfmark_client.download_release(releases[0])
-            format_statuses[content_type] = "requested" if queued else "request_failed"
-            logging.info(
-                f"{'✅ SUCCESS' if queued else '❌ ERROR'}: Shelfmark {content_type} download "
-                f"{'queued' if queued else 'failed'} for '{title}'"
-            )
+            queued_any = False
+            for release in picked:
+                queued = shelfmark_client.download_release(release)
+                queued_any = queued_any or queued
+                logging.info(
+                    f"{'✅ SUCCESS' if queued else '❌ ERROR'}: Shelfmark {content_type} download "
+                    f"({'queued' if queued else 'failed'}) for '{title}' "
+                    f"[{_release_language(release) or 'unknown'}] {release.get('title', '')}"
+                )
+            format_statuses[content_type] = "requested" if queued_any else "request_failed"
 
         statuses = list(format_statuses.values())
         if "requested" in statuses:
             status = "requested"
         elif "error" in statuses:
             status = "error"
+        elif "already_available" in statuses:
+            status = "already_available"
         elif "not_found" in statuses:
             status = "not_found"
         else:
@@ -1056,6 +1143,54 @@ def _get_collection_tags(synced_lists: List[Dict[str, str]]) -> List[str]:
     return list(tags)
 
 
+def _book_settings_for_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Per-list book settings carried by the item's Babelio source list."""
+    sources = get_source_lists_from_item(item)
+    source = next((s for s in sources if s.get("type") == "babelio"), sources[0] if sources else None)
+    if not source:
+        return {}
+    if "download_ebooks" in source:
+        return source
+    return get_list_settings(source["type"], source["id"])
+
+
+def _library_languages(match: Optional[Dict[str, Any]]) -> set:
+    """Known language codes of a library copy."""
+    if not match:
+        return set()
+    metadata = match.get("metadata") or (match.get("media") or {}).get("metadata") or {}
+    language = normalize_language(metadata.get("language"))
+    return {language.value} if language else set()
+
+
+def _library_language_ok(match: Optional[Dict[str, Any]], profile: Optional[Dict[str, Any]]) -> bool:
+    """Whether a library copy already satisfies the profile's primary language.
+
+    Unknown language counts as a match: we cannot prove the copy is unwanted,
+    so it must not trigger a duplicate download. A known fallback language
+    does not count: an existing English audiobook must not stop us from
+    requesting the French one, which is the point of the profile order.
+    """
+    languages = _library_languages(match)
+    if not languages:
+        return bool(match)
+    return bool(languages & set(_primary_profile_languages(profile)))
+
+
+def _resolve_language_profile(
+    profile_id: Optional[int], kind: str, cache: Dict[Any, Optional[Dict[str, Any]]]
+) -> Optional[Dict[str, Any]]:
+    """Load a list's profile by id, falling back to the format's default."""
+    key = (profile_id, kind)
+    if key in cache:
+        return cache[key]
+    profile = get_language_profile(int(profile_id)) if profile_id else None
+    if profile is None or profile.get("kind") != kind:
+        profile = get_default_language_profile(kind)
+    cache[key] = profile
+    return profile
+
+
 def sync_books_to_shelfmark(
     book_items: List[Dict[str, Any]],
     shelfmark_client: Optional[ShelfmarkClient],
@@ -1094,6 +1229,9 @@ def sync_books_to_shelfmark(
 
     # Build collection tags from synced lists
     collection_tags = _get_collection_tags(synced_lists or [])
+
+    # Language profiles are read per list; cache them for the whole run.
+    profile_cache: Dict[Any, Optional[Dict[str, Any]]] = {}
 
     if shelfmark_client is None:
         logging.warning(
@@ -1145,11 +1283,38 @@ def sync_books_to_shelfmark(
                 audiobookshelf_checked = False
                 logging.warning(f"Audiobookshelf check failed for '{title}': {e}")
 
-        want_ebook = not bool(komga_match)
-        want_audiobook = audiobookshelf_checked and not bool(audiobookshelf_match)
+        want_ebook = False
+        ebook_profile = None
+        audiobook_profile = None
+
+        if book_settings := _book_settings_for_item(item):
+            ebook_profile = _resolve_language_profile(
+                book_settings.get("ebook_language_profile_id"), "ebook", profile_cache
+            )
+            audiobook_profile = _resolve_language_profile(
+                book_settings.get("audiobook_language_profile_id"), "audiobook", profile_cache
+            )
+            want_ebook = bool(book_settings.get("download_ebooks", True)) and not (
+                komga_match and _library_language_ok(komga_match, ebook_profile)
+            )
+            want_audiobook = (
+                bool(book_settings.get("download_audiobooks", True))
+                and audiobookshelf_checked
+                and not (audiobookshelf_match and _library_language_ok(audiobookshelf_match, audiobook_profile))
+            )
+        else:
+            want_ebook = not bool(komga_match)
+            want_audiobook = audiobookshelf_checked and not bool(audiobookshelf_match)
 
         if not want_ebook and not want_audiobook:
-            if audiobookshelf_client is not None and not audiobookshelf_checked:
+            downloads_enabled = bool(book_settings) and (
+                book_settings.get("download_ebooks", True) or book_settings.get("download_audiobooks", True)
+            )
+            if book_settings and not downloads_enabled:
+                sync_results.results["skipped"] = sync_results.results.get("skipped", 0) + 1
+                sync_results.media_type_counts["book"] = sync_results.media_type_counts.get("book", 0) + 1
+                print(f"⏭️  {title}: ebook and audiobook downloads disabled for this list ({i}/{len(book_items)})")
+            elif audiobookshelf_client is not None and not audiobookshelf_checked:
                 # Ebook in Komga, audiobook presence unknown: don't request blindly.
                 sync_results.results["error"] = sync_results.results.get("error", 0) + 1
                 sync_results.media_type_counts["book"] = sync_results.media_type_counts.get("book", 0) + 1
@@ -1163,7 +1328,7 @@ def sync_books_to_shelfmark(
                     present.append("Komga")
                 if audiobookshelf_match:
                     present.append("Audiobookshelf")
-                print(f"☑️ {title}: Already in {' and '.join(present)} ({i}/{len(book_items)})")
+                print(f"☑️ {title}: Already in {' and '.join(present) or 'library'} ({i}/{len(book_items)})")
             continue
 
         if komga_match or audiobookshelf_match:
@@ -1175,7 +1340,10 @@ def sync_books_to_shelfmark(
             missing = ", ".join(
                 name for name, wanted in (("ebook", want_ebook), ("audiobook", want_audiobook)) if wanted
             )
-            print(f"➡️  {title}: already in {' + '.join(present)}, requesting {missing} ({i}/{len(book_items)})")
+            print(
+                f"➡️  {title}: already in {' + '.join(present)}, requesting {missing} "
+                f"(other language or missing) ({i}/{len(book_items)})"
+            )
 
         try:
             result = process_book_item(
@@ -1184,6 +1352,10 @@ def sync_books_to_shelfmark(
                 dry_run,
                 want_ebook=want_ebook,
                 want_audiobook=want_audiobook,
+                ebook_profile=ebook_profile,
+                audiobook_profile=audiobook_profile,
+                ebook_skip_languages=_library_languages(komga_match),
+                audiobook_skip_languages=_library_languages(audiobookshelf_match),
             )
             status = result["status"]
         except Exception as e:
@@ -1202,6 +1374,8 @@ def sync_books_to_shelfmark(
             # On next sync, the book will be found in Komga and tagged then.
         elif status == "skipped":
             print(f"⏭️  {title}: Skipped ({i}/{len(book_items)})")
+        elif status == "already_available":
+            print(f"☑️ {title}: Preferred language unavailable, library copy kept ({i}/{len(book_items)})")
         elif status == "not_found":
             print(f"❓ {title}: Not Found ({i}/{len(book_items)})")
             sync_results.not_found_items.append({"title": title, "year": item.get('year')})

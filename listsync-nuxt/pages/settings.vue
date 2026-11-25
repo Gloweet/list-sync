@@ -112,6 +112,11 @@
           />
         </div>
 
+        <!-- Languages Tab -->
+        <div v-if="activeTab === 'languages'" class="space-y-6">
+          <LanguageProfilesSettings />
+        </div>
+
         <!-- Users Tab -->
         <div v-if="activeTab === 'users'">
           <UsersManagement />
@@ -161,6 +166,7 @@ import {
   Code as CodeIcon,
   Info as InfoIcon,
   Users as UsersIcon,
+  Languages as LanguagesIcon,
 } from 'lucide-vue-next'
 
 const { showSuccess, showError, showInfo } = useToast()
@@ -198,6 +204,12 @@ const tabs = [
     label: 'Users',
     icon: UsersIcon,
     description: 'Manage Overseerr users for per-list assignment',
+  },
+  {
+    id: 'languages',
+    label: 'Languages',
+    icon: LanguagesIcon,
+    description: 'Language profiles for book downloads',
   },
   {
     id: 'advanced',

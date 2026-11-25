@@ -303,34 +303,6 @@ def get_audiobookshelf_config() -> Tuple[Optional[str], Optional[str]]:
     return url, api_key
 
 
-def get_shelfmark_languages() -> list:
-    """
-    Get the language codes allowed for audiobook releases, from the
-    comma-separated SHELFMARK_LANGUAGES env var (e.g. "fr" or "fr,en").
-
-    Shelfmark's release sources do not all honour its BOOK_LANGUAGE setting
-    (AudiobookBay ignores it), so ListSync filters the returned releases
-    itself before queueing one.
-
-    Returns:
-        list: Lowercased language codes; empty means no client-side filter
-    """
-    if os.path.exists('.env'):
-        load_dotenv()
-
-    raw = os.getenv('SHELFMARK_LANGUAGES', '')
-    languages = [lang.strip().lower() for lang in raw.split(',') if lang.strip()]
-    import logging
-    if languages:
-        logging.info(f"Shelfmark audiobook languages: {', '.join(languages)}")
-    else:
-        logging.warning(
-            "SHELFMARK_LANGUAGES not set - audiobook releases will not be filtered by language"
-        )
-
-    return languages
-
-
 def load_env_config(test_connection: bool = True) -> Tuple[Optional[str], Optional[str], Optional[str], float, bool, bool]:
     """
     Load configuration from database or environment variables (database preferred).

@@ -4,6 +4,7 @@ Letterboxd provider for ListSync.
 
 import logging
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any, Optional
 
@@ -114,6 +115,18 @@ def fetch_letterboxd_list(list_id: str) -> List[Dict[str, Any]]:
     
     try:
         with SB(uc=True, headless=True) as sb:
+            # A page or a script that never returns used to block the whole
+            # sync forever (Letterboxd lazy-load scroll). Timeouts make such a
+            # page raise instead, so the list is marked failed and the sync
+            # moves on to the next one.
+            sb.set_page_load_timeout(60)
+            try:
+                sb.set_script_timeout(30)
+            except Exception:
+                logging.warning("SeleniumBase has no set_script_timeout - scrolling can still block")
+            max_pages = 100
+            deadline = time.monotonic() + 600
+
             # Handle full URLs vs list IDs
             if list_id.startswith(('http://', 'https://')):
                 base_url = list_id.rstrip('/')
@@ -132,6 +145,11 @@ def fetch_letterboxd_list(list_id: str) -> List[Dict[str, Any]]:
             page = 1
             next_page_url = None  # Track the next page URL
             while True:
+                if page > max_pages or time.monotonic() > deadline:
+                    logging.warning(
+                        f"Letterboxd: stopping after {page - 1} page(s) (safety limit reached)"
+                    )
+                    break
                 # Check for cancellation at the start of each page
                 check_and_raise_if_cancelled()
                 
@@ -165,17 +183,30 @@ def fetch_letterboxd_list(list_id: str) -> List[Dict[str, Any]]:
                 # Scroll to load all lazy-loaded content
                 logging.info("Scrolling to load all content...")
                 scroll_attempts = 3 if is_watchlist else 10  # Watchlists load faster
+                scroll_failed = False
                 for i in range(scroll_attempts):
-                    sb.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                    try:
+                        sb.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                    except Exception as e:
+                        logging.warning(f"Letterboxd scroll timed out on page {page}: {e}")
+                        scroll_failed = True
+                        break
                     sb.sleep(1 if is_watchlist else 2)
-                    
+
                     # Also try scrolling to specific elements (for custom lists)
                     if not is_watchlist:
-                        items = sb.find_elements("div.listitem.js-listitem")
-                        if items:
-                            sb.execute_script("arguments[0].scrollIntoView(true);", items[-1])
-                            sb.sleep(1)
-                
+                        try:
+                            items = sb.find_elements("div.listitem.js-listitem")
+                            if items:
+                                sb.execute_script("arguments[0].scrollIntoView(true);", items[-1])
+                                sb.sleep(1)
+                        except Exception as e:
+                            logging.warning(f"Letterboxd element scroll failed on page {page}: {e}")
+                            scroll_failed = True
+                            break
+
+                if scroll_failed:
+                    logging.warning("Letterboxd: continuing with the items already loaded")
                 logging.info("Scrolling complete")
                 
                 # Extract data - different structure for watchlists vs custom lists

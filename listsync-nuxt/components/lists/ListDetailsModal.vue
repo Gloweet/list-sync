@@ -1,10 +1,45 @@
 <template>
   <Modal
     v-model="isOpen"
-    :title="list ? getDisplayName(list) : 'List Details'"
+    :title="displayName"
     size="xl"
     @close="handleClose"
   >
+    <template #header>
+      <div class="flex items-center gap-2 min-w-0 pr-8">
+        <template v-if="isEditingName">
+          <Input
+            v-model="nameDraft"
+            placeholder="List name"
+            class="max-w-xs"
+            @keyup.enter="saveName"
+          />
+          <Button
+            variant="primary"
+            size="sm"
+            :loading="savingName"
+            @click="saveName"
+          >
+            Save
+          </Button>
+          <Button variant="ghost" size="sm" @click="cancelEditName">
+            Cancel
+          </Button>
+        </template>
+        <template v-else>
+          <h2 class="text-xl font-bold text-foreground truncate">{{ displayName }}</h2>
+          <button
+            type="button"
+            class="p-2 rounded-full text-muted-foreground hover:text-foreground hover:bg-purple-500/20 transition-colors flex-shrink-0"
+            aria-label="Rename list"
+            @click="startEditName"
+          >
+            <PencilIcon :size="16" />
+          </button>
+        </template>
+      </div>
+    </template>
+
     <div v-if="list" class="space-y-6">
       <!-- List Info Section -->
       <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -65,6 +100,70 @@
           Copy URL
         </Button>
       </div>
+
+      <!-- Babelio book download settings -->
+      <Card
+        v-if="list.list_type === 'babelio'"
+        variant="default"
+        class="glass-card border border-purple-500/30"
+      >
+        <div class="space-y-4">
+          <div>
+            <h3 class="text-lg font-bold text-foreground titillium-web-semibold bg-gradient-to-r from-purple-400 to-purple-600 bg-clip-text text-transparent">
+              Book Downloads
+            </h3>
+            <p class="text-xs text-muted-foreground mt-1">
+              Choose which formats to request and the language order for this list.
+            </p>
+          </div>
+
+          <label class="flex items-center gap-2 cursor-pointer group">
+            <input
+              v-model="bookSettings.download_ebooks"
+              type="checkbox"
+              class="w-4 h-4 rounded border-2 border-purple-500/40 bg-black/40 text-purple-500 focus:ring-2 focus:ring-purple-500 focus:ring-offset-2 focus:ring-offset-black cursor-pointer transition-all"
+            />
+            <span class="text-sm text-muted-foreground group-hover:text-foreground transition-colors">
+              Download ebooks
+            </span>
+          </label>
+
+          <Select
+            v-model="ebookProfileId"
+            label="Ebook language profile"
+            :options="ebookProfileOptions"
+            :disabled="!bookSettings.download_ebooks"
+          />
+
+          <label class="flex items-center gap-2 cursor-pointer group">
+            <input
+              v-model="bookSettings.download_audiobooks"
+              type="checkbox"
+              class="w-4 h-4 rounded border-2 border-purple-500/40 bg-black/40 text-purple-500 focus:ring-2 focus:ring-purple-500 focus:ring-offset-2 focus:ring-offset-black cursor-pointer transition-all"
+            />
+            <span class="text-sm text-muted-foreground group-hover:text-foreground transition-colors">
+              Download audiobooks
+            </span>
+          </label>
+
+          <Select
+            v-model="audiobookProfileId"
+            label="Audiobook language profile"
+            :options="audiobookProfileOptions"
+            :disabled="!bookSettings.download_audiobooks"
+          />
+
+          <div class="flex justify-end">
+            <Button
+              variant="primary"
+              :loading="savingBookSettings"
+              @click="saveBookSettings"
+            >
+              Save Download Settings
+            </Button>
+          </div>
+        </div>
+      </Card>
 
       <!-- Items Preview -->
       <Card variant="default" class="glass-card border border-purple-500/30 hover:border-purple-400/50 transition-all duration-300">
@@ -153,8 +252,9 @@ import {
   XCircle as XCircleIcon,
   Clock as ClockIcon,
   AlertCircle as AlertCircleIcon,
+  Pencil as PencilIcon,
 } from 'lucide-vue-next'
-import type { List, EnrichedMediaItem } from '~/types'
+import type { List, EnrichedMediaItem, LanguageProfile } from '~/types'
 
 interface Props {
   modelValue: boolean
@@ -168,6 +268,7 @@ const emit = defineEmits<{
   'sync': [listType: string, listId: string]
   'delete': [listType: string, listId: string]
   'view-items': [listType: string, listId: string]
+  'updated': []
 }>()
 
 const isOpen = computed({
@@ -193,6 +294,107 @@ const itemsData = ref<{
   has_more: false
 })
 
+// Rename state
+const isEditingName = ref(false)
+const nameDraft = ref('')
+const savingName = ref(false)
+const nameOverride = ref<string | null>(null)
+
+// Babelio download settings
+const savingBookSettings = ref(false)
+const profiles = ref<LanguageProfile[]>([])
+const bookSettings = reactive({
+  download_ebooks: true,
+  download_audiobooks: true,
+})
+const ebookProfileId = ref<number>(0)
+const audiobookProfileId = ref<number>(0)
+
+const displayName = computed(() => {
+  return nameOverride.value || props.list?.display_name || props.list?.list_id || 'List Details'
+})
+
+const toProfileOptions = (kind: 'ebook' | 'audiobook') => [
+  { label: 'Use default profile', value: 0 },
+  ...profiles.value
+    .filter((profile) => profile.kind === kind)
+    .map((profile) => ({
+      label: profile.is_default ? `${profile.name} (default)` : profile.name,
+      value: profile.id,
+    })),
+]
+
+const ebookProfileOptions = computed(() => toProfileOptions('ebook'))
+const audiobookProfileOptions = computed(() => toProfileOptions('audiobook'))
+
+const applyListSettings = () => {
+  nameOverride.value = null
+  bookSettings.download_ebooks = props.list?.download_ebooks !== false
+  bookSettings.download_audiobooks = props.list?.download_audiobooks !== false
+  ebookProfileId.value = props.list?.ebook_language_profile_id || 0
+  audiobookProfileId.value = props.list?.audiobook_language_profile_id || 0
+}
+
+watch(() => props.list, applyListSettings, { immediate: true })
+
+const loadProfiles = async () => {
+  try {
+    const response = await api.getLanguageProfiles()
+    profiles.value = response.profiles || []
+  } catch (error: any) {
+    console.error('Error fetching language profiles:', error)
+  }
+}
+
+const startEditName = () => {
+  nameDraft.value = props.list?.name || ''
+  isEditingName.value = true
+}
+
+const cancelEditName = () => {
+  isEditingName.value = false
+}
+
+const saveName = async () => {
+  if (!props.list) return
+  const name = nameDraft.value.trim()
+  savingName.value = true
+  try {
+    await api.updateList(props.list.list_type, props.list.list_id, { name: name || null })
+    nameOverride.value = name || null
+    isEditingName.value = false
+    showSuccess('List renamed')
+    emit('updated')
+  } catch (error: any) {
+    showError('Rename failed', error.message)
+  } finally {
+    savingName.value = false
+  }
+}
+
+const saveBookSettings = async () => {
+  if (!props.list) return
+  savingBookSettings.value = true
+  try {
+    const response = await api.updateList(props.list.list_type, props.list.list_id, {
+      download_ebooks: bookSettings.download_ebooks,
+      download_audiobooks: bookSettings.download_audiobooks,
+      ebook_language_profile_id: ebookProfileId.value || null,
+      audiobook_language_profile_id: audiobookProfileId.value || null,
+    })
+    bookSettings.download_ebooks = response.download_ebooks !== false
+    bookSettings.download_audiobooks = response.download_audiobooks !== false
+    ebookProfileId.value = response.ebook_language_profile_id || 0
+    audiobookProfileId.value = response.audiobook_language_profile_id || 0
+    showSuccess('Download settings saved')
+    emit('updated')
+  } catch (error: any) {
+    showError('Save failed', error.message)
+  } finally {
+    savingBookSettings.value = false
+  }
+}
+
 // No need for local isSyncing - use computed from store
 
 // Watch for list changes to fetch items
@@ -205,6 +407,9 @@ watch(() => props.list, async (newList) => {
 watch(() => isOpen.value, async (open) => {
   if (open && props.list) {
     await fetchItems()
+    if (props.list.list_type === 'babelio') {
+      await loadProfiles()
+    }
   }
 })
 
@@ -349,10 +554,6 @@ const handleViewAllItems = () => {
   emit('view-items', props.list.list_type, props.list.list_id)
 }
 
-const getDisplayName = (list: List) => {
-  return list.display_name || list.list_id
-}
-
 const formatProvider = (type: string) => {
   const providers: Record<string, string> = {
     imdb: 'IMDb',
@@ -365,6 +566,7 @@ const formatProvider = (type: string) => {
     simkl: 'Simkl',
     tvdb: 'TVDB',
     anilist: 'AniList',
+    babelio: 'Babelio',
   }
   return providers[type.toLowerCase()] || type
 }

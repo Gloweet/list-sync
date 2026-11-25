@@ -275,6 +275,29 @@ def init_database():
             logging.info("Added user_id column to lists table")
         except sqlite3.OperationalError:
             pass
+
+        # Book-list settings: display name override and per-format download /
+        # language-profile configuration (Babelio lists only, but the columns
+        # are harmless on every list row).
+        for column, ddl in (
+            ("name", "ALTER TABLE lists ADD COLUMN name TEXT"),
+            ("download_ebooks", "ALTER TABLE lists ADD COLUMN download_ebooks INTEGER DEFAULT 1"),
+            ("download_audiobooks", "ALTER TABLE lists ADD COLUMN download_audiobooks INTEGER DEFAULT 1"),
+            ("ebook_language_profile_id", "ALTER TABLE lists ADD COLUMN ebook_language_profile_id INTEGER"),
+            ("audiobook_language_profile_id", "ALTER TABLE lists ADD COLUMN audiobook_language_profile_id INTEGER"),
+        ):
+            try:
+                cursor.execute(ddl)
+                logging.info(f"Added {column} column to lists table")
+            except sqlite3.OperationalError:
+                pass
+
+        # Names are optional, but unique when set (case-insensitive).
+        cursor.execute('''
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_lists_name_unique
+            ON lists(name COLLATE NOCASE)
+            WHERE name IS NOT NULL AND name <> ''
+        ''')
         
         # SIMKL is disabled, so we don't add simkl_id column anymore
         
@@ -448,6 +471,9 @@ def init_database():
     
     # Initialize configuration tables
     create_settings_tables()
+
+    # Language profiles (ordered language preference per book format)
+    create_language_profile_tables()
     
     # Migrate BLOB images to filesystem (one-time migration)
     # Only run if there are BLOB images that need migration
@@ -502,7 +528,11 @@ def save_list_id(list_id: str, list_type: str, list_url: Optional[str] = None, i
             item_count = 0
             
         cursor.execute(
-            "INSERT OR REPLACE INTO lists (list_type, list_id, list_url, item_count, user_id) VALUES (?, ?, ?, ?, ?)",
+            """INSERT INTO lists (list_type, list_id, list_url, item_count, user_id)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(list_type, list_id) DO UPDATE SET
+                   list_url = excluded.list_url,
+                   user_id = excluded.user_id""",
             (list_type, id_to_save, list_url, item_count, user_id)
         )
         conn.commit()
@@ -545,7 +575,12 @@ def load_list_ids() -> List[Dict[str, str]]:
     """Load all saved list IDs from database."""
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT list_type, list_id, list_url, item_count, last_synced, user_id FROM lists")
+        cursor.execute(
+            """SELECT list_type, list_id, list_url, item_count, last_synced, user_id,
+                      name, download_ebooks, download_audiobooks,
+                      ebook_language_profile_id, audiobook_language_profile_id
+               FROM lists"""
+        )
         results = []
         for row in cursor.fetchall():
             list_item = {"type": row[0], "id": row[1]}
@@ -574,7 +609,15 @@ def load_list_ids() -> List[Dict[str, str]]:
                 list_item["user_id"] = row[5]
             else:
                 list_item["user_id"] = "1"
-                
+
+            # Display name override (None when the list has no custom name)
+            list_item["name"] = row[6] if len(row) > 6 else None
+            # Per-format download flags (default: request both when missing)
+            list_item["download_ebooks"] = bool(row[7]) if len(row) > 7 and row[7] is not None else True
+            list_item["download_audiobooks"] = bool(row[8]) if len(row) > 8 and row[8] is not None else True
+            list_item["ebook_language_profile_id"] = row[9] if len(row) > 9 else None
+            list_item["audiobook_language_profile_id"] = row[10] if len(row) > 10 else None
+
             results.append(list_item)
         return results
 
@@ -593,6 +636,386 @@ def delete_list(list_type: str, list_id: str) -> bool:
     except Exception as e:
         logging.error(f"Error deleting list: {str(e)}")
         return False
+
+
+# ============================================================================
+# List settings (display name, per-format download flags, language profiles)
+# ============================================================================
+
+def get_list_settings(list_type: str, list_id: str) -> Dict[str, Any]:
+    """Return the per-list book settings, with defaults for missing values."""
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """SELECT name, download_ebooks, download_audiobooks,
+                      ebook_language_profile_id, audiobook_language_profile_id
+               FROM lists WHERE list_type = ? AND list_id = ?""",
+            (list_type, list_id),
+        )
+        row = cursor.fetchone()
+
+    if row is None:
+        return {
+            "name": None,
+            "download_ebooks": True,
+            "download_audiobooks": True,
+            "ebook_language_profile_id": None,
+            "audiobook_language_profile_id": None,
+        }
+    return {
+        "name": row[0],
+        "download_ebooks": bool(row[1]) if row[1] is not None else True,
+        "download_audiobooks": bool(row[2]) if row[2] is not None else True,
+        "ebook_language_profile_id": row[3],
+        "audiobook_language_profile_id": row[4],
+    }
+
+
+def list_name_exists(name: str, list_type: Optional[str] = None, list_id: Optional[str] = None) -> bool:
+    """Check whether another list already uses this display name (case-insensitive)."""
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT 1 FROM lists WHERE name = ? COLLATE NOCASE AND NOT (list_type = ? AND list_id = ?) LIMIT 1",
+            (name, list_type, list_id),
+        )
+        return cursor.fetchone() is not None
+
+
+def update_list_settings(list_type: str, list_id: str, changes: Dict[str, Any]) -> Dict[str, Any]:
+    """Update display name / download flags / language profiles for one list.
+
+    Only keys present in `changes` are written. Raises ValueError on an
+    unknown key, an empty or duplicate name, or a profile id that does not
+    exist or has the wrong kind.
+    """
+    allowed = {
+        "name", "download_ebooks", "download_audiobooks",
+        "ebook_language_profile_id", "audiobook_language_profile_id",
+    }
+    unknown = set(changes) - allowed
+    if unknown:
+        raise ValueError(f"Unknown setting(s): {', '.join(sorted(unknown))}")
+
+    assignments = []
+    values = []
+    for key, value in changes.items():
+        if key == "name":
+            if value is not None:
+                value = str(value).strip()
+                if not value:
+                    value = None
+                elif len(value) > 100:
+                    raise ValueError("List name must be 100 characters or fewer")
+            if value is not None and list_name_exists(value, list_type, list_id):
+                raise ValueError(f"A list named '{value}' already exists")
+            assignments.append("name = ?")
+            values.append(value)
+        elif key in ("download_ebooks", "download_audiobooks"):
+            assignments.append(f"{key} = ?")
+            values.append(1 if value else 0)
+        else:
+            if value is not None:
+                profile = get_language_profile(int(value))
+                expected_kind = "ebook" if key.startswith("ebook") else "audiobook"
+                if profile is None:
+                    raise ValueError(f"Language profile {value} does not exist")
+                if profile["kind"] != expected_kind:
+                    raise ValueError(f"Profile {value} is a {profile['kind']} profile, not {expected_kind}")
+            assignments.append(f"{key} = ?")
+            values.append(value)
+
+    if assignments:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"UPDATE lists SET {', '.join(assignments)} WHERE list_type = ? AND list_id = ?",
+                (*values, list_type, list_id),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError(f"List not found: {list_type}/{list_id}")
+            conn.commit()
+
+    return get_list_settings(list_type, list_id)
+
+
+# ============================================================================
+# Language profiles
+# ============================================================================
+
+PROFILE_KINDS = ("ebook", "audiobook")
+SEARCH_CRITERIA = ("always", "if_not_found")
+DEFAULT_PROFILE_ROWS = [
+    ("fr", "always"),
+    ("en", "if_not_found"),
+    ("de", "if_not_found"),
+    ("pt", "if_not_found"),
+]
+DEFAULT_PROFILE_NAMES = {
+    "ebook": "Ebook default",
+    "audiobook": "Audiobook default",
+}
+
+
+def create_language_profile_tables():
+    """Create language profile tables and seed one default profile per format."""
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS language_profiles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                kind TEXT NOT NULL DEFAULT 'ebook',
+                is_default INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS language_profile_rows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                profile_id INTEGER NOT NULL,
+                position INTEGER NOT NULL DEFAULT 0,
+                language TEXT NOT NULL,
+                search_criteria TEXT NOT NULL DEFAULT 'always',
+                UNIQUE(profile_id, language),
+                FOREIGN KEY(profile_id) REFERENCES language_profiles(id) ON DELETE CASCADE
+            )
+        ''')
+        conn.commit()
+
+    seed_default_language_profiles()
+
+
+def seed_default_language_profiles():
+    """Ensure each format has a default profile (French first, then fallbacks)."""
+    for kind in PROFILE_KINDS:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM language_profiles WHERE kind = ? LIMIT 1", (kind,))
+            existing = cursor.fetchone()
+            if existing:
+                cursor.execute(
+                    "SELECT 1 FROM language_profiles WHERE kind = ? AND is_default = 1 LIMIT 1", (kind,)
+                )
+                if cursor.fetchone() is None:
+                    cursor.execute(
+                        "UPDATE language_profiles SET is_default = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (existing[0],),
+                    )
+                    conn.commit()
+                continue
+
+            cursor.execute(
+                "INSERT INTO language_profiles (name, kind, is_default) VALUES (?, ?, 1)",
+                (DEFAULT_PROFILE_NAMES[kind], kind),
+            )
+            profile_id = cursor.lastrowid
+            for position, (language, criteria) in enumerate(DEFAULT_PROFILE_ROWS):
+                cursor.execute(
+                    """INSERT INTO language_profile_rows (profile_id, position, language, search_criteria)
+                       VALUES (?, ?, ?, ?)""",
+                    (profile_id, position, language, criteria),
+                )
+            conn.commit()
+            logging.info(f"Seeded default {kind} language profile (id {profile_id})")
+
+
+def _language_profile_from_row(cursor, row) -> Dict[str, Any]:
+    profile_id = row[0]
+    cursor.execute(
+        """SELECT id, position, language, search_criteria
+           FROM language_profile_rows WHERE profile_id = ? ORDER BY position, id""",
+        (profile_id,),
+    )
+    rows = [
+        {
+            "id": r[0],
+            "position": r[1],
+            "language": r[2],
+            "search_criteria": r[3],
+        }
+        for r in cursor.fetchall()
+    ]
+    return {
+        "id": profile_id,
+        "name": row[1],
+        "kind": row[2],
+        "is_default": bool(row[3]),
+        "rows": rows,
+    }
+
+
+def get_language_profiles() -> List[Dict[str, Any]]:
+    """Return every language profile with its ordered language rows."""
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, name, kind, is_default FROM language_profiles ORDER BY is_default DESC, name"
+        )
+        return [_language_profile_from_row(cursor, row) for row in cursor.fetchall()]
+
+
+def get_language_profile(profile_id: int) -> Optional[Dict[str, Any]]:
+    """Return one profile with its rows, or None."""
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, name, kind, is_default FROM language_profiles WHERE id = ?", (profile_id,)
+        )
+        row = cursor.fetchone()
+        return _language_profile_from_row(cursor, row) if row else None
+
+
+def get_default_language_profile(kind: str) -> Optional[Dict[str, Any]]:
+    """Return the default profile for a format, falling back to any profile."""
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, name, kind, is_default FROM language_profiles WHERE kind = ? ORDER BY is_default DESC, id LIMIT 1",
+            (kind,),
+        )
+        row = cursor.fetchone()
+        return _language_profile_from_row(cursor, row) if row else None
+
+
+def _validate_profile_rows(rows) -> List[tuple]:
+    from .languages import normalize_language
+
+    validated = []
+    seen = set()
+    for row in rows or []:
+        language_value = row.get("language") if hasattr(row, "get") else None
+        language = normalize_language(language_value)
+        if language is None:
+            raise ValueError(f"Unknown language: {language_value!r}")
+        criteria = (row.get("search_criteria") if hasattr(row, "get") else None) or "always"
+        if criteria not in SEARCH_CRITERIA:
+            raise ValueError(
+                f"Unknown search criteria {criteria!r} (expected one of {', '.join(SEARCH_CRITERIA)})"
+            )
+        if language.value in seen:
+            raise ValueError(f"Language {language.value} is listed twice")
+        seen.add(language.value)
+        validated.append((language.value, criteria))
+    return validated
+
+
+def _write_profile_rows(cursor, profile_id: int, rows: List[tuple]):
+    cursor.execute("DELETE FROM language_profile_rows WHERE profile_id = ?", (profile_id,))
+    for position, (language, criteria) in enumerate(rows):
+        cursor.execute(
+            """INSERT INTO language_profile_rows (profile_id, position, language, search_criteria)
+               VALUES (?, ?, ?, ?)""",
+            (profile_id, position, language, criteria),
+        )
+
+
+def create_language_profile(name: str, kind: str, rows) -> Dict[str, Any]:
+    """Create a profile. Raises ValueError on invalid input or duplicate name."""
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("Profile name is required")
+    if len(name) > 100:
+        raise ValueError("Profile name must be 100 characters or fewer")
+    if kind not in PROFILE_KINDS:
+        raise ValueError(f"Unknown profile kind {kind!r} (expected {' or '.join(PROFILE_KINDS)})")
+    validated = _validate_profile_rows(rows)
+    if not validated:
+        raise ValueError("A language profile needs at least one language")
+
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO language_profiles (name, kind, is_default) VALUES (?, ?, 0)", (name, kind)
+            )
+            profile_id = cursor.lastrowid
+            _write_profile_rows(cursor, profile_id, validated)
+            conn.commit()
+    except sqlite3.IntegrityError:
+        raise ValueError(f"A language profile named '{name}' already exists")
+
+    return get_language_profile(profile_id)
+
+
+def update_language_profile(
+    profile_id: int,
+    name: Optional[str] = None,
+    rows=None,
+    is_default: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Update a profile's name, rows and/or default flag."""
+    current = get_language_profile(profile_id)
+    if current is None:
+        raise ValueError(f"Language profile {profile_id} does not exist")
+
+    assignments = []
+    values = []
+    if name is not None:
+        name = str(name).strip()
+        if not name:
+            raise ValueError("Profile name is required")
+        if len(name) > 100:
+            raise ValueError("Profile name must be 100 characters or fewer")
+        assignments.append("name = ?")
+        values.append(name)
+
+    validated = _validate_profile_rows(rows) if rows is not None else None
+    if validated is not None and not validated:
+        raise ValueError("A language profile needs at least one language")
+
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            if assignments:
+                cursor.execute(
+                    f"UPDATE language_profiles SET {', '.join(assignments)}, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (*values, profile_id),
+                )
+            if validated is not None:
+                _write_profile_rows(cursor, profile_id, validated)
+                cursor.execute(
+                    "UPDATE language_profiles SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (profile_id,)
+                )
+            if is_default:
+                cursor.execute(
+                    "UPDATE language_profiles SET is_default = 0, updated_at = CURRENT_TIMESTAMP WHERE kind = ? AND id <> ?",
+                    (current["kind"], profile_id),
+                )
+                cursor.execute(
+                    "UPDATE language_profiles SET is_default = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (profile_id,),
+                )
+            conn.commit()
+    except sqlite3.IntegrityError:
+        raise ValueError(f"A language profile named '{name}' already exists")
+
+    return get_language_profile(profile_id)
+
+
+def delete_language_profile(profile_id: int):
+    """Delete a non-default profile and unlink it from every list."""
+    profile = get_language_profile(profile_id)
+    if profile is None:
+        return False
+    if profile["is_default"]:
+        raise ValueError("The default language profile cannot be deleted")
+
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE lists SET ebook_language_profile_id = NULL WHERE ebook_language_profile_id = ?",
+            (profile_id,),
+        )
+        cursor.execute(
+            "UPDATE lists SET audiobook_language_profile_id = NULL WHERE audiobook_language_profile_id = ?",
+            (profile_id,),
+        )
+        cursor.execute("DELETE FROM language_profile_rows WHERE profile_id = ?", (profile_id,))
+        cursor.execute("DELETE FROM language_profiles WHERE id = ?", (profile_id,))
+        conn.commit()
+    return True
 
 
 def configure_sync_interval(interval_hours: float):
